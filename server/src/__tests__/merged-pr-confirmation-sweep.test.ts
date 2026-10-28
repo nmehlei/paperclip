@@ -117,6 +117,40 @@ describe("merged pull-request confirmation extraction", () => {
     })).toEqual([]);
   });
 
+  it("recognizes Azure DevOps pull-request URLs alongside GitHub references", () => {
+    expect(getMergeConfirmationPullRequestReferences({
+      kind: "request_confirmation",
+      title: "Merge the Azure DevOps PR?",
+      summary: "CI is green.",
+      payload: {
+        version: 1,
+        prompt: "Merge https://dev.azure.com/contoso/Web%20Platform/_git/web-app/pullrequest/1296 and paperclipai/paperclip#39?",
+      },
+    })).toEqual([
+      { host: "github.com", owner: "paperclipai", repo: "paperclip", number: 39 },
+      {
+        host: "dev.azure.com",
+        organization: "contoso",
+        project: "Web Platform",
+        repository: "web-app",
+        number: 1296,
+      },
+    ]);
+  });
+
+  it("fails closed when an Azure DevOps merge confirmation includes an additional action clause", () => {
+    expect(getMergeConfirmationPullRequestReferences({
+      kind: "request_confirmation",
+      title: "Merge the linked PR?",
+      summary: null,
+      payload: {
+        version: 1,
+        prompt: "Merge https://dev.azure.com/contoso/Web/_git/web-app/pullrequest/1296?",
+        detailsMarkdown: "Approve the production deployment after it merges.",
+      },
+    })).toEqual([]);
+  });
+
   it("fails closed when a merge confirmation includes an additional action clause", () => {
     expect(getMergeConfirmationPullRequestReferences({
       kind: "request_confirmation",
@@ -319,6 +353,107 @@ describeEmbeddedPostgres("merged pull-request confirmation sweep", () => {
           interactionId: interactionIds.merged,
           resolutionActorKind: "system",
           pullRequests: ["paperclipai/paperclip#39"],
+        }),
+      }),
+    ]));
+  });
+
+  it("accepts merged Azure DevOps pull requests and keeps open ones pending", async () => {
+    const companyId = randomUUID();
+    const issueId = randomUUID();
+    const agentId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: "ADO",
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "Coder",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Land the infrastructure change",
+      status: "in_review",
+      priority: "medium",
+      assigneeAgentId: agentId,
+    });
+
+    const mergedId = randomUUID();
+    const openId = randomUUID();
+    const common = {
+      companyId,
+      issueId,
+      kind: "request_confirmation",
+      status: "pending",
+      continuationPolicy: "wake_assignee_on_accept",
+      requestedResolverPolicy: "board_only",
+      effectiveResolverPolicy: "board_only",
+    } as const;
+    await db.insert(issueThreadInteractions).values([
+      {
+        ...common,
+        id: mergedId,
+        title: "Merge https://dev.azure.com/contoso/Web/_git/web-app/pullrequest/1296?",
+        payload: { version: 1, prompt: "Merge the Azure DevOps PR?" },
+      },
+      {
+        ...common,
+        id: openId,
+        title: "Merge https://dev.azure.com/contoso/Web/_git/web-app/pullrequest/1297?",
+        payload: { version: 1, prompt: "Merge the Azure DevOps PR?" },
+      },
+    ]);
+
+    const wakeup = vi.fn(async () => ({ id: "wake-1" }));
+    const resolvePullRequestState = vi.fn(async (_companyId: string, reference: { host: string; number: number }) =>
+      reference.host === "dev.azure.com" && reference.number === 1296 ? "merged" as const : "open" as const
+    );
+    const service = issueThreadInteractionService(db, { wakeup, resolvePullRequestState });
+
+    await expect(service.sweepMergedPullRequestConfirmations()).resolves.toEqual({
+      checked: 2,
+      candidates: 2,
+      accepted: 1,
+      woken: 1,
+    });
+
+    const stored = await db
+      .select({ id: issueThreadInteractions.id, status: issueThreadInteractions.status })
+      .from(issueThreadInteractions)
+      .where(inArray(issueThreadInteractions.id, [mergedId, openId]));
+    expect(new Map(stored.map((row) => [row.id, row.status]))).toEqual(new Map([
+      [mergedId, "accepted"],
+      [openId, "pending"],
+    ]));
+    expect(resolvePullRequestState).toHaveBeenCalledWith(companyId, expect.objectContaining({
+      host: "dev.azure.com",
+      organization: "contoso",
+      project: "Web",
+      repository: "web-app",
+      number: 1296,
+    }));
+    expect(wakeup).toHaveBeenCalledWith(agentId, expect.objectContaining({
+      requestedByActorId: "system:pr-merged",
+      idempotencyKey: `interaction:${mergedId}:accepted`,
+    }));
+
+    const audit = await db.select().from(activityLog);
+    expect(audit).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        action: "issue.thread_interaction_accepted",
+        details: expect.objectContaining({
+          interactionId: mergedId,
+          pullRequests: ["contoso/Web/web-app!1296"],
         }),
       }),
     ]));
