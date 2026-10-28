@@ -1,10 +1,22 @@
 import { describe, expect, it, vi } from "vitest";
 import type { Db } from "@paperclipai/db";
 import {
+  azureDevOpsOrganizationSecretName,
   azureDevOpsPullRequestApiUrl,
   createAzureDevOpsPullRequestMergeStateResolver,
+  createAzureDevOpsTokenProvider,
   extractAzureDevOpsPullRequestReferences,
 } from "../services/azure-devops-pull-request-merge.js";
+
+const companySecrets = vi.hoisted(() => new Map<string, string>());
+
+vi.mock("../services/secrets.js", () => ({
+  secretService: () => ({
+    getByName: async (_companyId: string, name: string) =>
+      companySecrets.has(name) ? { id: name } : null,
+    resolveSecretValue: async (_companyId: string, id: string) => companySecrets.get(id) ?? "",
+  }),
+}));
 
 const reference = {
   host: "dev.azure.com",
@@ -98,5 +110,38 @@ describe("Azure DevOps pull-request merge state", () => {
       const fetchImpl = vi.fn(respond);
       await expect(resolverWith(fetchImpl as unknown as typeof fetch)("company-1", reference)).resolves.toBe("unknown");
     }
+  });
+});
+
+describe("Azure DevOps tokens per organization", () => {
+  it("derives the organization secret name from the organization", () => {
+    expect(azureDevOpsOrganizationSecretName("AZURE_DEVOPS_PAT", "contoso")).toBe("AZURE_DEVOPS_PAT_CONTOSO");
+    expect(azureDevOpsOrganizationSecretName("AZURE_DEVOPS_PAT", "my-org.eu")).toBe("AZURE_DEVOPS_PAT_MY_ORG_EU");
+  });
+
+  it("prefers the organization secret over the shared one", async () => {
+    companySecrets.clear();
+    companySecrets.set("AZURE_DEVOPS_PAT", "shared");
+    companySecrets.set("AZURE_DEVOPS_PAT_FABRIKAM", "fabrikam-only");
+    const provider = createAzureDevOpsTokenProvider({} as Db, { env: {} });
+    await expect(provider("company-1", "Fabrikam")).resolves.toBe("fabrikam-only");
+    await expect(provider("company-1", "contoso")).resolves.toBe("shared");
+  });
+
+  it("returns null when neither an organization nor a shared token exists", async () => {
+    companySecrets.clear();
+    companySecrets.set("AZURE_DEVOPS_PAT_FABRIKAM", "fabrikam-only");
+    const provider = createAzureDevOpsTokenProvider({} as Db, { env: {} });
+    await expect(provider("company-1", "contoso")).resolves.toBeNull();
+  });
+
+  it("asks the token provider for the pull request's organization", async () => {
+    const tokenProvider = vi.fn(async () => "pat-value");
+    const resolver = createAzureDevOpsPullRequestMergeStateResolver({} as Db, {
+      tokenProvider,
+      fetch: (async () => jsonResponse({ status: "completed" })) as unknown as typeof fetch,
+    });
+    await resolver("company-1", reference);
+    expect(tokenProvider).toHaveBeenCalledWith("company-1", "contoso");
   });
 });
