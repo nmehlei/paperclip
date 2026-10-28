@@ -49,15 +49,27 @@ export function extractAzureDevOpsPullRequestReferences(values: readonly unknown
   return [...references.values()];
 }
 
-export type AzureDevOpsTokenProvider = (companyId: string) => Promise<string | null>;
+// One identity rarely reaches every organization (organizations in different Microsoft Entra
+// tenants cannot share a PAT), so each organization may carry its own secret,
+// e.g. AZURE_DEVOPS_PAT_CONTOSO; the plain names are the shared fallback.
+export type AzureDevOpsTokenProvider = (companyId: string, organization: string) => Promise<string | null>;
+
+export function azureDevOpsOrganizationSecretName(baseName: string, organization: string) {
+  return `${baseName}_${organization.toUpperCase().replace(/[^A-Z0-9]+/g, "_")}`;
+}
 
 export function createAzureDevOpsTokenProvider(
   db: Db,
   opts: { secretNames?: readonly string[]; env?: NodeJS.ProcessEnv } = {},
 ): AzureDevOpsTokenProvider {
   const secrets = secretService(db);
-  return async (companyId) => {
-    for (const secretName of opts.secretNames ?? DEFAULT_AZURE_DEVOPS_TOKEN_SECRET_NAMES) {
+  return async (companyId, organization) => {
+    const baseNames = opts.secretNames ?? DEFAULT_AZURE_DEVOPS_TOKEN_SECRET_NAMES;
+    const secretNames = [
+      ...baseNames.map((name) => azureDevOpsOrganizationSecretName(name, organization)),
+      ...baseNames,
+    ];
+    for (const secretName of secretNames) {
       const secret = await Promise.resolve(secrets.getByName(companyId, secretName)).catch(() => null);
       if (!secret) continue;
       const token = await secrets
@@ -97,7 +109,7 @@ export function createAzureDevOpsPullRequestMergeStateResolver(
     companyId: string,
     reference: AzureDevOpsPullRequestReference,
   ): Promise<PullRequestMergeState> => {
-    const token = await tokenProvider(companyId).catch(() => null);
+    const token = await tokenProvider(companyId, reference.organization).catch(() => null);
     if (!token) return "unknown";
     try {
       const response = await fetchImpl(azureDevOpsPullRequestApiUrl(reference), {
