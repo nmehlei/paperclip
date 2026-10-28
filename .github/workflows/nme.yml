@@ -1,0 +1,106 @@
+name: NME
+
+on:
+  push:
+    branches: [nme]
+    tags: ["nme/v*"]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch, tag or commit to test
+        required: true
+        default: nme
+
+permissions: {}
+
+concurrency:
+  group: nme-${{ github.event.inputs.ref || github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.inputs.ref || github.ref }}
+          persist-credentials: false
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          package-manager-cache: false
+
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 9.15.4
+          run_install: false
+
+      - name: Install dependencies
+        run: |
+          if ! pnpm install --frozen-lockfile; then
+            pnpm install --resolution-only --ignore-scripts --no-frozen-lockfile
+            pnpm install --frozen-lockfile
+          fi
+
+      - name: Typecheck server
+        run: pnpm --filter @paperclipai/server typecheck
+
+      - name: Merge confirmation tests
+        run: |
+          pnpm run preflight:workspace-links
+          pnpm exec vitest run \
+            server/src/__tests__/azure-devops-pull-request-merge.test.ts \
+            server/src/__tests__/merged-pr-confirmation-sweep.test.ts \
+            server/src/__tests__/idle-response-waits.test.ts
+
+  image:
+    if: startsWith(github.ref, 'refs/tags/nme/v')
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Compute version
+        id: version
+        run: echo "version=${GITHUB_REF#refs/tags/nme/v}" >> "$GITHUB_OUTPUT"
+
+      - name: Free runner disk
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/share/swift /usr/local/lib/android \
+            /usr/local/share/boost /usr/local/share/powershell /opt/ghc \
+            /opt/hostedtoolcache/CodeQL /opt/hostedtoolcache/PyPy /opt/hostedtoolcache/Ruby || true
+          docker system prune -af || true
+          df -h /
+
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Build and push
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          target: production
+          platforms: linux/amd64
+          push: true
+          build-args: |
+            PAPERCLIP_BUILD_VERSION=${{ steps.version.outputs.version }}
+            PAPERCLIP_BUILD_COMMIT=${{ github.sha }}
+          tags: |
+            ghcr.io/${{ github.repository }}:${{ steps.version.outputs.version }}
+            ghcr.io/${{ github.repository }}:sha-${{ github.sha }}
