@@ -23,8 +23,16 @@ pending for a person to answer.
 
 ## Credential
 
-The sweep reads a personal access token with **Code (Read)** scope from the first
-company secret named `AZURE_DEVOPS_TOKEN`, `AZURE_DEVOPS_PAT` or
-`AZURE_DEVOPS_EXT_PAT`, and falls back to the server's `AZURE_DEVOPS_EXT_PAT`
-environment variable. Without a token, Azure DevOps pull requests resolve as
-unknown and their confirmations stay pending.
+The sweep reads a personal access token with **Code (Read)** scope from a company
+secret, chosen per organization so that organizations in different Microsoft Entra
+tenants can each have their own token:
+
+1. `AZURE_DEVOPS_TOKEN_<ORG>`, `AZURE_DEVOPS_PAT_<ORG>` or `AZURE_DEVOPS_EXT_PAT_<ORG>`,
+   where `<ORG>` is the organization name in upper case, with each run of characters
+   other than letters and digits replaced by `_` (`my-org` becomes `AZURE_DEVOPS_PAT_MY_ORG`);
+2. `AZURE_DEVOPS_TOKEN`, `AZURE_DEVOPS_PAT` or `AZURE_DEVOPS_EXT_PAT`, shared by all
+   organizations;
+3. the server's `AZURE_DEVOPS_EXT_PAT` environment variable.
+
+Without a token, or with one the organization rejects, Azure DevOps pull requests
+resolve as unknown and their confirmations stay pending.
