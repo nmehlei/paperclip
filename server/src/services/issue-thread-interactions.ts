@@ -135,15 +135,23 @@ import {
   type IssueThreadInteractionResolverRestriction,
 } from "./issue-thread-interaction-resolution.js";
 import {
-  createPullRequestMergeStateResolver,
-  extractGitHubPullRequestReferences,
   setBoundedPullRequestCacheEntry,
-  type GitHubPullRequestReference,
   type PullRequestMergeState,
 } from "./github-pull-request-merge.js";
+import { AZURE_DEVOPS_PULL_REQUEST_URL_PATTERN } from "./azure-devops-pull-request-merge.js";
+import {
+  createMergeConfirmationPullRequestStateResolver,
+  extractMergeConfirmationPullRequestReferences,
+  pullRequestReferenceKey,
+  pullRequestReferenceLabel,
+  type MergeConfirmationPullRequestReference,
+} from "./merge-confirmation-pull-requests.js";
 
 export { extractGitHubPullRequestReferences } from "./github-pull-request-merge.js";
 export type { GitHubPullRequestReference } from "./github-pull-request-merge.js";
+export { extractAzureDevOpsPullRequestReferences } from "./azure-devops-pull-request-merge.js";
+export type { AzureDevOpsPullRequestReference } from "./azure-devops-pull-request-merge.js";
+export type { MergeConfirmationPullRequestReference } from "./merge-confirmation-pull-requests.js";
 
 type InteractionActor = {
   identityContextId?: string | null;
@@ -190,7 +198,7 @@ type InteractionWakeup = (
 export type IssueThreadInteractionServiceOptions = {
   resolvePullRequestState?: (
     companyId: string,
-    reference: GitHubPullRequestReference,
+    reference: MergeConfirmationPullRequestReference,
   ) => Promise<PullRequestMergeState>;
   wakeup?: InteractionWakeup;
   pullRequestCacheTtlMs?: number;
@@ -220,10 +228,12 @@ const MERGE_CONFIRMATION_ALLOWED_WORDS = new Set([
   "and",
   "approved",
   "are",
+  "azure",
   "both",
   "checks",
   "ci",
   "confirm",
+  "devops",
   "github",
   "green",
   "is",
@@ -258,8 +268,13 @@ const MERGE_CONFIRMATION_ALLOWED_WORDS = new Set([
 ]);
 
 function isMergeConfirmationOnlyText(value: string) {
+  AZURE_DEVOPS_PULL_REQUEST_URL_PATTERN.lastIndex = 0;
+  const withoutAzureDevOpsUrls = value.replace(
+    AZURE_DEVOPS_PULL_REQUEST_URL_PATTERN,
+    " pr_reference ",
+  );
   GITHUB_PULL_REQUEST_URL_PATTERN.lastIndex = 0;
-  const withoutUrls = value.replace(
+  const withoutUrls = withoutAzureDevOpsUrls.replace(
     GITHUB_PULL_REQUEST_URL_PATTERN,
     " pr_reference ",
   );
@@ -343,7 +358,7 @@ export function getMergeConfirmationPullRequestReferences(
     return [];
   }
 
-  return extractGitHubPullRequestReferences(trustedTextValues);
+  return extractMergeConfirmationPullRequestReferences(trustedTextValues);
 }
 
 const ISSUE_THREAD_INTERACTION_IDEMPOTENCY_CONSTRAINT =
@@ -1971,11 +1986,11 @@ export function issueThreadInteractionService(
   const now = opts.now ?? (() => new Date());
   const defaultPullRequestStateResolver = opts.resolvePullRequestState
     ? null
-    : createPullRequestMergeStateResolver(db);
+    : createMergeConfirmationPullRequestStateResolver(db);
 
   async function resolvePullRequestState(
     companyId: string,
-    reference: GitHubPullRequestReference,
+    reference: MergeConfirmationPullRequestReference,
   ): Promise<PullRequestMergeState> {
     if (opts.resolvePullRequestState)
       return opts.resolvePullRequestState(companyId, reference);
@@ -1986,7 +2001,7 @@ export function issueThreadInteractionService(
     entries: Array<{
       key: string;
       companyId: string;
-      reference: GitHubPullRequestReference;
+      reference: MergeConfirmationPullRequestReference;
     }>,
   ) {
     const states = new Map<string, PullRequestMergeState>();
@@ -2948,7 +2963,7 @@ export function issueThreadInteractionService(
       const checkedAt = now().getTime();
       const cacheTtlMs = opts.pullRequestCacheTtlMs ?? 5 * 60 * 1000;
       for (const hint of mergedHints) {
-        const key = `${hint.companyId}:${hint.owner.toLowerCase()}/${hint.repo.toLowerCase()}#${hint.number}`;
+        const key = `${hint.companyId}:${pullRequestReferenceKey({ host: "github.com", owner: hint.owner, repo: hint.repo, number: hint.number })}`;
         setBoundedPullRequestCacheEntry(pullRequestStateCache, key, {
           state: "merged",
           checkedAt,
@@ -2959,12 +2974,12 @@ export function issueThreadInteractionService(
         {
           key: string;
           companyId: string;
-          reference: GitHubPullRequestReference;
+          reference: MergeConfirmationPullRequestReference;
         }
       >();
       for (const candidate of eligible) {
         for (const reference of candidate.references) {
-          const key = `${candidate.issue.companyId}:${reference.owner.toLowerCase()}/${reference.repo.toLowerCase()}#${reference.number}`;
+          const key = `${candidate.issue.companyId}:${pullRequestReferenceKey(reference)}`;
           const cached = pullRequestStateCache.get(key);
           if (cached && checkedAt - cached.checkedAt < cacheTtlMs) continue;
           uniqueReferences.set(key, {
@@ -2989,7 +3004,7 @@ export function issueThreadInteractionService(
       let woken = 0;
       for (const candidate of eligible) {
         const allMerged = candidate.references.every((reference) => {
-          const key = `${candidate.issue.companyId}:${reference.owner.toLowerCase()}/${reference.repo.toLowerCase()}#${reference.number}`;
+          const key = `${candidate.issue.companyId}:${pullRequestReferenceKey(reference)}`;
           return pullRequestStateCache.get(key)?.state === "merged";
         });
         if (!allMerged) continue;
@@ -3004,10 +3019,7 @@ export function issueThreadInteractionService(
               systemId: "system:pr-merged",
               resolutionDetails: {
                 source: "merged_pull_request_sweep",
-                pullRequests: candidate.references.map(
-                  (reference) =>
-                    `${reference.owner}/${reference.repo}#${reference.number}`,
-                ),
+                pullRequests: candidate.references.map(pullRequestReferenceLabel),
               },
             },
           });
