@@ -326,3 +326,9 @@ COPY --chown=node:node --from=cloud-plugins /app/packages/plugins/sandbox-provid
 # both a CommonJS `require.resolve` and an ECMAScript `import` — an entry
 # on `NODE_PATH` would satisfy only the first and silently fail the second.
 COPY --chown=node:node --from=cloud-server-deps /app/.cloud-server-deps/node_modules /app/server/node_modules
+
+FROM production AS nme
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends chromium fonts-liberation fonts-noto-color-emoji \
+ && rm -rf /var/lib/apt/lists/*
+ENV CHROME_PATH=/usr/bin/chromium
