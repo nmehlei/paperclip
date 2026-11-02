@@ -534,6 +534,9 @@ async function assertRequestConfirmationResolutionAllowedUnderLock(
     })) throw conflict("This completion review is no longer current or assigned to this agent.");
   }
   if (!isReviewVerdict) return;
+  // The merged-PR sweep only accepts a card that asks for nothing but the merge, once every linked
+  // PR is merged: the merge itself is the human verdict, so the review policy is already satisfied.
+  if (actor.systemId === "system:pr-merged") return;
 
   const verdictActor = actor.agentId
     ? { type: "agent" as const, id: actor.agentId }
@@ -2943,6 +2946,9 @@ export function issueThreadInteractionService(
 
       let accepted = 0;
       let woken = 0;
+      // One card that cannot be accepted or woken must not hold back the others; the first error is
+      // rethrown after the loop so the caller still logs it.
+      let firstError: unknown = null;
       for (const candidate of eligible) {
         const allMerged = candidate.references.every((reference) => {
           const key = `${candidate.issue.companyId}:${pullRequestReferenceKey(reference)}`;
@@ -2972,7 +2978,8 @@ export function issueThreadInteractionService(
             error.status === 409
           )
             continue;
-          throw error;
+          firstError ??= error;
+          continue;
         }
         if (resolved.interaction.status !== "accepted") continue;
         accepted += 1;
@@ -2989,39 +2996,44 @@ export function issueThreadInteractionService(
         ) {
           continue;
         }
-        await opts.wakeup(wakeIssue.assigneeAgentId, {
-          source: "automation",
-          triggerDetail: "system",
-          reason: "issue_commented",
-          payload: {
-            issueId: wakeIssue.id,
-            interactionId: resolved.interaction.id,
-            interactionKind: resolved.interaction.kind,
-            interactionStatus: resolved.interaction.status,
-            sourceCommentId: resolved.interaction.sourceCommentId ?? null,
-            sourceRunId: resolved.interaction.sourceRunId ?? null,
-            mutation: "interaction",
-            resolutionSource: "merged_pull_request_sweep",
-          },
-          idempotencyKey: `interaction:${resolved.interaction.id}:accepted`,
-          // A merged-PR confirmation may already be visible in an external
-          // provider conversation. Keep its continuation causally isolated
-          // from unrelated queued chat/internal work on the same task.
-          allowRunCoalescing: false,
-          requestedByActorType: "system",
-          requestedByActorId: "system:pr-merged",
-          contextSnapshot: {
-            issueId: wakeIssue.id,
-            taskId: wakeIssue.id,
-            interactionId: resolved.interaction.id,
-            interactionKind: resolved.interaction.kind,
-            interactionStatus: resolved.interaction.status,
-            wakeReason: "issue_commented",
-            source: "merged_pull_request_sweep",
-          },
-        });
-        woken += 1;
+        try {
+          await opts.wakeup(wakeIssue.assigneeAgentId, {
+            source: "automation",
+            triggerDetail: "system",
+            reason: "issue_commented",
+            payload: {
+              issueId: wakeIssue.id,
+              interactionId: resolved.interaction.id,
+              interactionKind: resolved.interaction.kind,
+              interactionStatus: resolved.interaction.status,
+              sourceCommentId: resolved.interaction.sourceCommentId ?? null,
+              sourceRunId: resolved.interaction.sourceRunId ?? null,
+              mutation: "interaction",
+              resolutionSource: "merged_pull_request_sweep",
+            },
+            idempotencyKey: `interaction:${resolved.interaction.id}:accepted`,
+            // A merged-PR confirmation may already be visible in an external
+            // provider conversation. Keep its continuation causally isolated
+            // from unrelated queued chat/internal work on the same task.
+            allowRunCoalescing: false,
+            requestedByActorType: "system",
+            requestedByActorId: "system:pr-merged",
+            contextSnapshot: {
+              issueId: wakeIssue.id,
+              taskId: wakeIssue.id,
+              interactionId: resolved.interaction.id,
+              interactionKind: resolved.interaction.kind,
+              interactionStatus: resolved.interaction.status,
+              wakeReason: "issue_commented",
+              source: "merged_pull_request_sweep",
+            },
+          });
+          woken += 1;
+        } catch (error) {
+          firstError ??= error;
+        }
       }
+      if (firstError) throw firstError;
 
       return {
         checked: rows.length,
