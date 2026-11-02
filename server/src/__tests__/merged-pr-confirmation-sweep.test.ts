@@ -458,4 +458,116 @@ describeEmbeddedPostgres("merged pull-request confirmation sweep", () => {
       }),
     ]));
   });
+
+  async function seedAgentIssue(prefix: string) {
+    const companyId = randomUUID();
+    const issueId = randomUUID();
+    const agentId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: prefix,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "Coder",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Land the change",
+      status: "in_review",
+      priority: "medium",
+      assigneeAgentId: agentId,
+    });
+    return { companyId, issueId, agentId };
+  }
+
+  it("accepts a merged card that the agent bound as the issue's review", async () => {
+    const { companyId, issueId, agentId } = await seedAgentIssue("REV");
+    const cardId = randomUUID();
+    await db.insert(issueThreadInteractions).values({
+      id: cardId,
+      companyId,
+      issueId,
+      kind: "request_confirmation",
+      status: "pending",
+      continuationPolicy: "wake_assignee",
+      requestedResolverPolicy: "human_only",
+      effectiveResolverPolicy: "human_only",
+      createdByAgentId: agentId,
+      title: "Merge https://dev.azure.com/contoso/Web/_git/web-app/pullrequest/1345?",
+      payload: { version: 1, prompt: "Merge the linked pull requests?", acceptLabel: "Merged" },
+    });
+    // The agent moved the issue into review with this card as its review path (NME-41).
+    await db.insert(activityLog).values({
+      companyId,
+      actorType: "agent",
+      actorId: agentId,
+      action: "issue.updated",
+      entityType: "issue",
+      entityId: issueId,
+      details: { status: "in_review", _previous: { status: "in_progress" }, reviewInteractionId: cardId },
+    });
+
+    const wakeup = vi.fn(async () => ({ id: "wake-1" }));
+    const service = issueThreadInteractionService(db, {
+      wakeup,
+      resolvePullRequestState: vi.fn(async () => "merged" as const),
+    });
+
+    await expect(service.sweepMergedPullRequestConfirmations()).resolves.toEqual({
+      checked: 1,
+      candidates: 1,
+      accepted: 1,
+      woken: 1,
+    });
+    const [stored] = await db
+      .select({ status: issueThreadInteractions.status })
+      .from(issueThreadInteractions)
+      .where(inArray(issueThreadInteractions.id, [cardId]));
+    expect(stored?.status).toBe("accepted");
+  });
+
+  it("keeps sweeping the other cards when one fails, then reports the failure", async () => {
+    const first = await seedAgentIssue("ONE");
+    const second = await seedAgentIssue("TWO");
+    const cardIds = [randomUUID(), randomUUID()];
+    await db.insert(issueThreadInteractions).values([first, second].map((seed, index) => ({
+      id: cardIds[index],
+      companyId: seed.companyId,
+      issueId: seed.issueId,
+      kind: "request_confirmation",
+      status: "pending",
+      continuationPolicy: "wake_assignee",
+      requestedResolverPolicy: "board_only",
+      effectiveResolverPolicy: "board_only",
+      title: `Merge https://dev.azure.com/contoso/Web/_git/web-app/pullrequest/${1400 + index}?`,
+      payload: { version: 1, prompt: "Merge the linked pull requests?" },
+    })));
+
+    const wakeup = vi.fn(async () => {
+      throw new Error("wakeup unavailable");
+    });
+    const service = issueThreadInteractionService(db, {
+      wakeup,
+      resolvePullRequestState: vi.fn(async () => "merged" as const),
+    });
+
+    await expect(service.sweepMergedPullRequestConfirmations()).rejects.toThrow("wakeup unavailable");
+    expect(wakeup).toHaveBeenCalledTimes(2);
+    const stored = await db
+      .select({ status: issueThreadInteractions.status })
+      .from(issueThreadInteractions)
+      .where(inArray(issueThreadInteractions.id, cardIds));
+    expect(stored.map((row) => row.status)).toEqual(["accepted", "accepted"]);
+  });
 });
