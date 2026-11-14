@@ -133,7 +133,7 @@ describeEmbeddedPostgres("loadWakeHistory", () => {
       { ...wake(companyId, issueId, h(1)), action: ADO_WAIT_ACTIVITY.pause },
     ]);
     await db.insert(issueComments).values([
-      { companyId, issueId, authorUserId: "board-user", authorType: "user", body: "go", createdAt: h(6) },
+      { companyId, issueId, authorUserId: "board-user", authorType: "user", body: "go", createdAt: h(12) },
       // agent and system comments must not reset the count
       { companyId, issueId, authorAgentId: agentId, authorType: "agent", body: "ok", createdAt: h(1.5) },
       { companyId, issueId, authorType: "system", body: "sweep note", createdAt: h(1.2) },
