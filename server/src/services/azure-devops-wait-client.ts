@@ -177,7 +177,7 @@ export function createAdoWaitClient(
             companyId,
             org,
             "policies",
-            `${base}/policy/configurations?repositoryId=${encodeURIComponent(repositoryId)}&refName=${encodeURIComponent(str(prBody.targetRefName)!)}&policyType=${ADO_BUILD_POLICY_TYPE_ID}&api-version=7.1`,
+            `${base}/git/policy/configurations?repositoryId=${encodeURIComponent(repositoryId)}&refName=${encodeURIComponent(str(prBody.targetRefName)!)}&policyType=${ADO_BUILD_POLICY_TYPE_ID}&api-version=7.1`,
           )
         : Promise.resolve(null),
     ]);
@@ -284,7 +284,7 @@ export function createAdoWaitClient(
     );
     if (!isRec(timeline)) return null;
     const waitingOnApproval = arr(timeline.records).some(
-      (r) => isRec(r) && r.state === "inProgress" && (r.type === "Checkpoint" || r.type === "Checkpoint.Approval"),
+      (r) => isRec(r) && r.state === "inProgress" && r.type === "Checkpoint.Approval",
     );
     return { status, result, waitingOnApproval };
   }

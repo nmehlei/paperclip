@@ -78,7 +78,7 @@ const prRoutes = (over: Routes = {}): Routes => ({
   "/pullrequests/1556/threads": () => json(threads),
   "/_apis/policy/evaluations": () => json(evaluations),
   "/_apis/build/builds/77": () => json({ sourceVersion: "merge1", triggerInfo: { "pr.sourceSha": "src1" } }),
-  "/_apis/policy/configurations": () => json(policyConfigs([{ isEnabled: true, isBlocking: true }])),
+  "/_apis/git/policy/configurations": () => json(policyConfigs([{ isEnabled: true, isBlocking: true }])),
   "/pullrequests/1556?": () => json(prBody),
   ...over,
 });
@@ -129,7 +129,7 @@ describe("pr()", () => {
 
   it("ignores disabled and non-blocking build policies", async () => {
     const { fn } = router(prRoutes({
-      "/_apis/policy/configurations": () => json(policyConfigs([
+      "/_apis/git/policy/configurations": () => json(policyConfigs([
         { isEnabled: false, isBlocking: true },
         { isEnabled: true, isBlocking: false },
       ])),
@@ -137,8 +137,17 @@ describe("pr()", () => {
     expect((await client(fn).pr("c1", ref))?.hasBuildPolicy).toBe(false);
   });
 
+  it("queries the git-area policy configurations endpoint", async () => {
+    const { fn, calls } = router(prRoutes());
+    await client(fn).pr("c1", ref);
+    const url = calls.find((u) => u.includes("policy/configurations"))!;
+    expect(url).toContain("/_apis/git/policy/configurations?");
+    expect(url).toContain("repositoryId=repo-1");
+    expect(url).toContain("refName=refs%2Fheads%2Fmain");
+  });
+
   it("reports hasBuildPolicy null when the policy call fails", async () => {
-    const { fn } = router(prRoutes({ "/_apis/policy/configurations": () => json({}, 500) }));
+    const { fn } = router(prRoutes({ "/_apis/git/policy/configurations": () => json({}, 500) }));
     expect((await client(fn).pr("c1", ref))?.hasBuildPolicy).toBeNull();
   });
 
@@ -182,6 +191,13 @@ describe("build()", () => {
     });
     expect(await client(fn).build("c1", target)).toEqual({ status: "inProgress", result: null, waitingOnApproval: true });
   });
+  it("does not treat a plain checkpoint as waiting on approval", async () => {
+    const { fn } = router({
+      "/builds/4690/timeline": () => json({ records: [{ type: "Checkpoint", state: "inProgress" }] }),
+      "/builds/4690": () => json({ status: "inProgress" }),
+    });
+    expect((await client(fn).build("c1", target))?.waitingOnApproval).toBe(false);
+  });
   it("maps a finished build", async () => {
     const { fn } = router({ "/builds/4690": () => json({ status: "completed", result: "succeeded" }) });
     expect(await client(fn).build("c1", target)).toEqual({ status: "completed", result: "succeeded", waitingOnApproval: false });
@@ -224,5 +240,16 @@ describe("read failure logging", () => {
     await c.pr("c1", { ...ref, number: 1556 });
     // pr read of pharao2k fails on its first call (call name "pr"), separate from "builds"
     expect(loggerWarn).toHaveBeenCalledTimes(4);
+  });
+
+  it("logs a policies failure separately from builds in the same hour", async () => {
+    loggerWarn.mockClear();
+    const t = Date.parse("2026-11-14T10:00:00Z");
+    const { fn } = router(prRoutes({ "/_apis/git/policy/configurations": () => json({}, 401) }));
+    const c = client(fn, "pat", () => new Date(t));
+    await c.build("c1", { kind: "build", organization: "pharao2k", project: "P", buildId: 1 });
+    await c.pr("c1", ref);
+    expect(loggerWarn).toHaveBeenCalledWith({ org: "pharao2k", call: "builds", status: 404 }, "azure devops wait read failed");
+    expect(loggerWarn).toHaveBeenCalledWith({ org: "pharao2k", call: "policies", status: 401 }, "azure devops wait read failed");
   });
 });
