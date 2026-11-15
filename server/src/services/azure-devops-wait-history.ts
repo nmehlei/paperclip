@@ -205,3 +205,31 @@ export async function withIssueWakeReservation<T>(
   for (const publication of publications) publishActivity(publication);
   return outcome;
 }
+
+export const PAUSED_MESSAGE = "Automatic wakes paused: limit reached. Reply on the issue to resume.";
+
+export function adoWaitSweepDisabled(env: NodeJS.ProcessEnv = process.env) {
+  return env.NME_ADO_WAIT_SWEEP?.trim().toLowerCase() === "off";
+}
+
+/** Logs the paused entry unless one is already newer than the last wake. Call inside a reservation. */
+export async function logPausedOnce(
+  ctx: WakeReservationContext,
+  issueId: string,
+  pendingEvent: string,
+): Promise<void> {
+  const since = ctx.history.lastSweepWakeAt ? new Date(ctx.history.lastSweepWakeAt) : new Date(0);
+  const [existing] = await ctx.tx
+    .select({ id: activityLog.id })
+    .from(activityLog)
+    .where(and(
+      eq(activityLog.companyId, ctx.companyId),
+      eq(activityLog.action, ADO_WAIT_ACTIVITY.pause),
+      eq(activityLog.entityType, "issue"),
+      eq(activityLog.entityId, issueId),
+      gt(activityLog.createdAt, since),
+    ))
+    .orderBy(desc(activityLog.createdAt))
+    .limit(1);
+  if (!existing) await ctx.log(ADO_WAIT_ACTIVITY.pause, { message: PAUSED_MESSAGE, pendingEvent });
+}

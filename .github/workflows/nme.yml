@@ -49,11 +49,15 @@ jobs:
       - name: Typecheck server
         run: pnpm --filter @paperclipai/server typecheck
 
-      - name: Merge confirmation tests
+      - name: NME tests
         run: |
           pnpm run preflight:workspace-links
           pnpm exec vitest run \
             server/src/__tests__/azure-devops-pull-request-merge.test.ts \
+            server/src/__tests__/azure-devops-wait-client.test.ts \
+            server/src/__tests__/azure-devops-wait-decision.test.ts \
+            server/src/__tests__/azure-devops-wait-history.test.ts \
+            server/src/__tests__/azure-devops-wait-sweep.test.ts \
             server/src/__tests__/merged-pr-confirmation-sweep.test.ts \
             server/src/__tests__/idle-response-waits.test.ts
 

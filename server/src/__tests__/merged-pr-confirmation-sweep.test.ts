@@ -7,9 +7,11 @@ import {
   companies,
   createDb,
   goals,
+  heartbeatRuns,
   issueThreadInteractions,
   issues,
 } from "@paperclipai/db";
+import { ADO_WAIT_ACTIVITY } from "../services/azure-devops-wait-history.js";
 import {
   extractGitHubPullRequestReferences,
   getMergeConfirmationPullRequestReferences,
@@ -178,6 +180,8 @@ describeEmbeddedPostgres("merged pull-request confirmation sweep", () => {
   }, 20_000);
 
   afterEach(async () => {
+    vi.unstubAllEnvs();
+    await db.delete(heartbeatRuns);
     await db.delete(activityLog);
     await db.delete(issueThreadInteractions);
     await db.delete(issues);
@@ -569,5 +573,129 @@ describeEmbeddedPostgres("merged pull-request confirmation sweep", () => {
       .from(issueThreadInteractions)
       .where(inArray(issueThreadInteractions.id, cardIds));
     expect(stored.map((row) => row.status)).toEqual(["accepted", "accepted"]);
+  });
+
+  async function seedCard(prefix: string, number: number) {
+    const seed = await seedAgentIssue(prefix);
+    const cardId = randomUUID();
+    await db.insert(issueThreadInteractions).values({
+      id: cardId,
+      companyId: seed.companyId,
+      issueId: seed.issueId,
+      kind: "request_confirmation",
+      status: "pending",
+      continuationPolicy: "wake_assignee",
+      requestedResolverPolicy: "board_only",
+      effectiveResolverPolicy: "board_only",
+      title: `Merge https://dev.azure.com/contoso/Web/_git/web-app/pullrequest/${number}?`,
+      payload: { version: 1, prompt: "Merge the linked pull requests?" },
+    });
+    return { ...seed, cardId };
+  }
+
+  async function addWakes(companyId: string, issueId: string, count: number) {
+    for (let i = 0; i < count; i += 1) {
+      await db.insert(activityLog).values({
+        companyId, actorType: "system", actorId: "nme_ado_wait_sweep", action: ADO_WAIT_ACTIVITY.wake,
+        entityType: "issue", entityId: issueId, details: { reason: "pipeline_finished" },
+        createdAt: new Date(Date.now() - (count - i) * 60_000),
+      });
+    }
+  }
+
+  async function cardStatus(cardId: string) {
+    const [row] = await db
+      .select({ status: issueThreadInteractions.status })
+      .from(issueThreadInteractions)
+      .where(inArray(issueThreadInteractions.id, [cardId]));
+    return row?.status;
+  }
+
+  async function entries(issueId: string, action: string) {
+    return (await db.select().from(activityLog)).filter((r) => r.entityId === issueId && r.action === action);
+  }
+
+  function mergedService(wakeup: ReturnType<typeof vi.fn>) {
+    return issueThreadInteractionService(db, {
+      wakeup: wakeup as never,
+      resolvePullRequestState: vi.fn(async () => "merged" as const),
+    });
+  }
+
+  it("holds acceptance during a quota pause and accepts after it", async () => {
+    const f = await seedCard("QUO", 1501);
+    await db.insert(heartbeatRuns).values({
+      companyId: f.companyId, agentId: f.agentId, issueId: f.issueId, scopeKind: "issue", status: "failed",
+      errorCode: "provider_quota", error: "try again in 2 hours",
+      finishedAt: new Date(), createdAt: new Date(),
+    });
+    const wakeup = vi.fn(async () => ({ id: "w" }));
+    await expect(mergedService(wakeup).sweepMergedPullRequestConfirmations()).resolves.toMatchObject({ accepted: 0, woken: 0 });
+    expect(await cardStatus(f.cardId)).toBe("pending");
+    expect(wakeup).not.toHaveBeenCalled();
+    expect(await entries(f.issueId, ADO_WAIT_ACTIVITY.wake)).toHaveLength(0);
+    expect(await entries(f.issueId, ADO_WAIT_ACTIVITY.pause)).toHaveLength(0);
+
+    await db.delete(heartbeatRuns);
+    await expect(mergedService(wakeup).sweepMergedPullRequestConfirmations()).resolves.toMatchObject({ accepted: 1, woken: 1 });
+    expect(await cardStatus(f.cardId)).toBe("accepted");
+  });
+
+  it("holds acceptance at the wake cap and logs one paused entry", async () => {
+    const f = await seedCard("CAP", 1502);
+    await addWakes(f.companyId, f.issueId, 6);
+    const wakeup = vi.fn(async () => ({ id: "w" }));
+    const service = mergedService(wakeup);
+    await service.sweepMergedPullRequestConfirmations();
+    await service.sweepMergedPullRequestConfirmations();
+    expect(await cardStatus(f.cardId)).toBe("pending");
+    expect(wakeup).not.toHaveBeenCalled();
+    const paused = await entries(f.issueId, ADO_WAIT_ACTIVITY.pause);
+    expect(paused).toHaveLength(1);
+    expect(paused[0]!.details).toEqual({
+      message: "Automatic wakes paused: limit reached. Reply on the issue to resume.",
+      pendingEvent: "merge_accepted",
+    });
+    expect(await entries(f.issueId, ADO_WAIT_ACTIVITY.wake)).toHaveLength(6);
+  });
+
+  it("logs a wake entry for an accepted card", async () => {
+    const f = await seedCard("LOG", 1503);
+    const wakeup = vi.fn(async () => ({ id: "w" }));
+    await mergedService(wakeup).sweepMergedPullRequestConfirmations();
+    const wakes = await entries(f.issueId, ADO_WAIT_ACTIVITY.wake);
+    expect(wakes).toHaveLength(1);
+    expect(wakes[0]!.details).toEqual({ reason: "merge_accepted" });
+  });
+
+  it("drops the reservation when the wake fails", async () => {
+    const f = await seedCard("DRP", 1504);
+    const wakeup = vi.fn(async () => { throw new Error("wakeup unavailable"); });
+    await expect(mergedService(wakeup).sweepMergedPullRequestConfirmations()).rejects.toThrow("wakeup unavailable");
+    expect(await entries(f.issueId, ADO_WAIT_ACTIVITY.wake)).toHaveLength(0);
+  });
+
+  it("the merge sweep and the wait sweep racing on one issue at 5 wakes wake once", async () => {
+    const f = await seedCard("RAC", 1505);
+    await addWakes(f.companyId, f.issueId, 5);
+    const wakeup = vi.fn(async () => ({ id: "w" }));
+    const service = mergedService(wakeup);
+    await Promise.all([
+      service.sweepMergedPullRequestConfirmations(),
+      service.sweepMergedPullRequestConfirmations(),
+    ]);
+    expect(wakeup).toHaveBeenCalledTimes(1);
+    expect(await entries(f.issueId, ADO_WAIT_ACTIVITY.wake)).toHaveLength(6);
+  });
+
+  it("behaves as before when the kill switch is off", async () => {
+    vi.stubEnv("NME_ADO_WAIT_SWEEP", "off");
+    const f = await seedCard("OFF", 1506);
+    await addWakes(f.companyId, f.issueId, 6);
+    const wakeup = vi.fn(async () => ({ id: "w" }));
+    await expect(mergedService(wakeup).sweepMergedPullRequestConfirmations()).resolves.toMatchObject({ accepted: 1, woken: 1 });
+    expect(await cardStatus(f.cardId)).toBe("accepted");
+    expect(await entries(f.issueId, ADO_WAIT_ACTIVITY.wake)).toHaveLength(6);
+    expect(await entries(f.issueId, ADO_WAIT_ACTIVITY.pause)).toHaveLength(0);
   });
 });

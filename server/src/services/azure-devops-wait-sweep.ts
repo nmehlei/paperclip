@@ -31,6 +31,8 @@ import {
 import {
   ADO_WAIT_ACTIVITY,
   ADO_WAIT_ACTOR_ID,
+  adoWaitSweepDisabled,
+  logPausedOnce,
   withIssueWakeReservation,
 } from "./azure-devops-wait-history.js";
 import { normalizeIssueExecutionPolicy } from "./issue-execution-policy.js";
@@ -42,7 +44,6 @@ import { secretService } from "./secrets.js";
 export const ADO_WAIT_SERVICE_NAME = "nme_ado_wait";
 
 const BACKSTOP_TIMEOUT_MS = 7 * 24 * 3600_000;
-const PAUSED_MESSAGE = "Automatic wakes paused: limit reached. Reply on the issue to resume.";
 const CLOSED_STATUSES = ["done", "cancelled"];
 
 type AdoWaitClient = Pick<ReturnType<typeof createAdoWaitClient>, "pr" | "build" | "probe">;
@@ -72,9 +73,7 @@ export type AdoWaitWakeup = (
   },
 ) => Promise<unknown>;
 
-export function adoWaitSweepDisabled(env: NodeJS.ProcessEnv = process.env) {
-  return env.NME_ADO_WAIT_SWEEP?.trim().toLowerCase() === "off";
-}
+export { adoWaitSweepDisabled };
 
 export function loadAdoWaitConfig(env: NodeJS.ProcessEnv = process.env): AdoWaitConfig {
   const reviewerOrgs = (env.NME_ADO_REVIEWER_ORGS ?? "pharao2k")
@@ -359,20 +358,7 @@ export function azureDevOpsWaitSweepService(
         return { keep: kept, value: { action: "wake" as const, summary: decision.summary } };
       }
       if (decision.action === "pause") {
-        const since = ctx.history.lastSweepWakeAt ? new Date(ctx.history.lastSweepWakeAt) : new Date(0);
-        const [existing] = await ctx.tx
-          .select({ id: activityLog.id })
-          .from(activityLog)
-          .where(and(
-            eq(activityLog.companyId, ctx.companyId),
-            eq(activityLog.action, ADO_WAIT_ACTIVITY.pause),
-            eq(activityLog.entityType, "issue"),
-            eq(activityLog.entityId, candidate.issueId),
-            gt(activityLog.createdAt, since),
-          ))
-          .orderBy(desc(activityLog.createdAt))
-          .limit(1);
-        if (!existing) await ctx.log(ADO_WAIT_ACTIVITY.pause, { message: PAUSED_MESSAGE, pendingEvent: decision.pendingEvent });
+        await logPausedOnce(ctx, candidate.issueId, decision.pendingEvent);
         return { keep: false, value: { action: "pause" as const } };
       }
       if (decision.action === "extend_backstop") {
