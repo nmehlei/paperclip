@@ -55,8 +55,9 @@ Events that wake the assignee:
 A pipeline that waits on a manual approval extends the monitor to the 72 h backstop
 instead of waking.
 
-Each kept wake posts a system comment `Event: <summary>` on the issue (monitor notes
-are not shown to agents).
+Each wake from the wait sweep posts a system comment `Event: <summary>` on the issue
+(monitor notes are not shown to agents). A `merge_accepted` wake posts no comment: the
+accepted interaction is carried in the wake payload, as before.
 
 ### Bounds
 
@@ -69,10 +70,11 @@ are not shown to agents).
 - At the cap, one `nme_ado_wait.paused` entry is logged (the pending event is recorded);
   further ticks add none until the next wake.
 
-### Credential
+### PAT scopes
 
 The PAT needs **Code (Read)** and **Build (Read)** scopes, resolved per organization as
-described under Credential below. Policy evaluations are read with API version
+described under Credential below. Edit the existing PAT to add the scope; never
+regenerate it. Policy evaluations are read with API version
 `7.1-preview`, everything else with `7.1`.
 
 ### Configuration
@@ -96,7 +98,7 @@ waits then fall back to the 72 h backstop.
 
 ## Credential
 
-The sweep reads a personal access token with **Code (Read)** scope from a company
+The sweeps read a personal access token with **Code (Read)** and **Build (Read)** scopes from a company
 secret, chosen per organization so that organizations in different Microsoft Entra
 tenants can each have their own token:
 
