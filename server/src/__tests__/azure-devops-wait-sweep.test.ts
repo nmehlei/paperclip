@@ -527,22 +527,26 @@ describeEmbeddedPostgres("azure devops wait sweep", () => {
 
   it("two concurrent sweeps on an issue with 5 wakes produce exactly one more wake", async () => {
     const f = await seed();
-    await setMonitor(f.issueId, { link: BUILD_URL(40) });
+    await setMonitor(f.issueId, { link: PR_URL });
     await addWakes(f.companyId, f.issueId, 5);
     const deps = spies();
     deps.triggerIssueMonitor.mockImplementation((async () => {
       await new Promise((resolve) => setTimeout(resolve, 150));
       return { outcome: "triggered" as const };
     }) as never);
+    // Each sweep reads a different source commit, so both see a new event and only the cap separates them.
     const client = fakeClient();
+    client.pr
+      .mockImplementationOnce(async () => finalPr({ lastMergeSourceCommit: "c1" }))
+      .mockImplementationOnce(async () => finalPr({ lastMergeSourceCommit: "c2" }));
     const results = await Promise.all([service(deps, client).sweep(), service(deps, client).sweep()]);
 
+    expect(client.pr).toHaveBeenCalledTimes(2);
     expect(results.reduce((sum, r) => sum + r.woken, 0)).toBe(1);
-    // The second sweep waits for the lock, then sees build 40 already delivered (before the cap).
-    expect(results.reduce((sum, r) => sum + r.paused, 0)).toBe(0);
+    expect(results.reduce((sum, r) => sum + r.paused, 0)).toBe(1);
     expect(deps.triggerIssueMonitor).toHaveBeenCalledTimes(1);
     expect(await activity(f.issueId, ADO_WAIT_ACTIVITY.wake)).toHaveLength(6);
-    expect(await activity(f.issueId, ADO_WAIT_ACTIVITY.pause)).toHaveLength(0);
+    expect(await activity(f.issueId, ADO_WAIT_ACTIVITY.pause)).toHaveLength(1);
   });
 
   it("does nothing when NME_ADO_WAIT_SWEEP is off", async () => {
