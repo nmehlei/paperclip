@@ -64,7 +64,6 @@ function run(input: {
   pr?: AdoPrSnapshot | null;
   build?: Parameters<typeof decideWait>[0]["build"];
   history?: WakeHistory;
-  pending?: boolean;
   nextCheck?: string | null;
   now?: Date;
   delivered?: Parameters<typeof decideWait>[0]["delivered"];
@@ -77,7 +76,6 @@ function run(input: {
     history: input.history ?? noHistory,
     config,
     organization: "pharao2k",
-    monitorPendingForSamePr: input.pending ?? false,
     monitorNextCheckAt: input.nextCheck ?? null,
     now: input.now ?? NOW,
     delivered: input.delivered,
@@ -198,9 +196,10 @@ describe("azure devops wait decision", () => {
     expect(run({ subject: card(minAgo(300)), pr: p })).toEqual({ action: "hold", reason: "quiet_period" });
   });
 
-  it("defers merge-card activity to a pending wait monitor on the same PR", () => {
+  it("merge-card activity wakes even with a pending wait monitor on the same PR", () => {
+    // The card owns the handed-over PR; the monitor is the one held (mergeCardPendingForSamePr).
     const p = pr({ threads: [voteThread(-10, minAgo(60))] });
-    expect(run({ subject: card(minAgo(300)), pr: p, pending: true })).toEqual({ action: "none" });
+    expect(run({ subject: card(minAgo(300)), pr: p })).toMatchObject({ action: "wake", reason: "pr_activity" });
   });
 
   it("ignores merge-card activity on a completed PR", () => {

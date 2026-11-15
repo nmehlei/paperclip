@@ -149,12 +149,14 @@ export function decideWait(input: {
   history: WakeHistory;
   config: AdoWaitConfig;
   organization: string;
-  monitorPendingForSamePr: boolean;
   monitorNextCheckAt: string | null;
   now: Date;
   /** Monitor subjects: the event already delivered for this link, so a re-parked wait does not fire again. */
   delivered?: DeliveredWakes;
-  /** Monitor subjects: a pending merge card on the same PR means the PR is already handed over. */
+  /**
+   * Monitor subjects: a pending merge card on the same PR means the PR is already handed over;
+   * the card's sweep owns review activity and the merge, the monitor is held.
+   */
   mergeCardPendingForSamePr?: boolean;
 }): WaitDecision {
   const { subject, history, config, organization, now } = input;
@@ -164,7 +166,7 @@ export function decideWait(input: {
 
   if (subject.source === "merge_card") {
     const pr = input.pr;
-    if (!pr || input.monitorPendingForSamePr) return NONE;
+    if (!pr) return NONE;
     if (pr.status !== "active") return NONE;
     const baseline = Math.max(ms(subject.cardCreatedAt) || 0, ms(history.lastSweepWakeAt) || 0);
     const newest = newestActivity(pr, identityFor(config, organization), baseline);

@@ -122,7 +122,6 @@ type Candidate = {
   organization: string;
   link: string;
   monitorNextCheckAt: string | null;
-  monitorPendingForSamePr: boolean;
 };
 
 async function loadCandidates(db: Db): Promise<Candidate[]> {
@@ -149,16 +148,10 @@ async function loadCandidates(db: Db): Promise<Candidate[]> {
     ));
 
   const candidates: Candidate[] = [];
-  const monitorPrs = new Map<string, Set<string>>();
   for (const row of monitorRows) {
     const monitor = (row.executionPolicy as { monitor?: Record<string, unknown> } | null)?.monitor ?? {};
     const target = resolveAdoWaitTarget(monitor.externalRef, monitor.notes ?? row.monitorNotes);
     if (!target || !row.agentId) continue;
-    if (target.kind === "pr") {
-      const set = monitorPrs.get(row.id) ?? new Set<string>();
-      set.add(adoPullRequestKey(target.ref));
-      monitorPrs.set(row.id, set);
-    }
     candidates.push({
       issueId: row.id,
       companyId: row.companyId,
@@ -168,7 +161,6 @@ async function loadCandidates(db: Db): Promise<Candidate[]> {
       organization: target.kind === "pr" ? target.ref.organization : target.organization,
       link: targetLink(target),
       monitorNextCheckAt: row.monitorNextCheckAt?.toISOString() ?? null,
-      monitorPendingForSamePr: false,
     });
   }
 
@@ -214,7 +206,6 @@ async function loadCandidates(db: Db): Promise<Candidate[]> {
           organization: ref.organization,
           link: targetLink({ kind: "pr", ref }),
           monitorNextCheckAt: null,
-          monitorPendingForSamePr: monitorPrs.get(card.issue.id)?.has(adoPullRequestKey(ref)) ?? false,
         });
       }
     }
@@ -387,7 +378,6 @@ export function azureDevOpsWaitSweepService(
         history: ctx.history,
         config,
         organization: candidate.organization,
-        monitorPendingForSamePr: candidate.monitorPendingForSamePr,
         monitorNextCheckAt: candidate.monitorNextCheckAt,
         now: ctx.now,
       });

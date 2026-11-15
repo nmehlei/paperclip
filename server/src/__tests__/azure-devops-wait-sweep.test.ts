@@ -343,6 +343,34 @@ describeEmbeddedPostgres("azure devops wait sweep", () => {
     expect(await eventComments(f.issueId)).toHaveLength(1);
   });
 
+  it("wakes once for review activity with a wait monitor and a pending merge card on the same PR", async () => {
+    const f = await seed();
+    await setMonitor(f.issueId, { link: PR_URL });
+    const activityAt = new Date(Date.now() - 30 * 60_000).toISOString();
+    await db.insert(issueThreadInteractions).values({
+      companyId: f.companyId, issueId: f.issueId, kind: "request_confirmation", status: "pending",
+      continuationPolicy: "wake_assignee_on_accept", requestedResolverPolicy: "board_only",
+      effectiveResolverPolicy: "board_only", title: `Merge ${PR_URL}?`,
+      payload: { version: 1, prompt: "Merge the PR?" }, createdAt: new Date(Date.now() - 2 * HOUR),
+    });
+    const client = fakeClient({
+      pr: finalPr({
+        threads: [{
+          id: 1, vote: null,
+          comments: [{ authorUniqueName: "nicolas@example.com", parentCommentId: 0, commentType: "text", publishedAt: activityAt, lastUpdatedAt: activityAt }],
+        }],
+      }),
+    });
+    const deps = spies();
+    const result = await service(deps, client).sweep();
+
+    expect(result).toMatchObject({ checked: 2, woken: 1 });
+    expect(deps.triggerIssueMonitor).not.toHaveBeenCalled();
+    expect(deps.wakeup).toHaveBeenCalledTimes(1);
+    const wakes = await activity(f.issueId, ADO_WAIT_ACTIVITY.wake);
+    expect(wakes.map((w) => (w.details as { reason: string }).reason)).toEqual(["pr_activity"]);
+  });
+
   it("skips a merge-card wake when the card or the assignee changed after the candidate load", async () => {
     const f = await seed();
     const other = await db.insert(agents).values({
