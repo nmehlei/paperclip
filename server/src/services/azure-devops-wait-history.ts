@@ -1,5 +1,6 @@
 import { and, desc, eq, gt, isNull, or, sql } from "drizzle-orm";
-import { activityLog, heartbeatRuns, issueComments, type Db } from "@paperclipai/db";
+import { activityLog, heartbeatRuns, issueComments, issues, type Db } from "@paperclipai/db";
+import { logActivity, publishActivity, type ActivityPublication } from "./activity-log.js";
 import type { WakeHistory } from "./azure-devops-wait-decision.js";
 
 export const ADO_WAIT_ACTIVITY = {
@@ -126,4 +127,81 @@ export async function loadWakeHistory(db: Db, companyId: string, issueId: string
     lastSweepWakeAt: wakes[0]?.createdAt.toISOString() ?? null,
     quotaPausedUntil,
   };
+}
+
+export const ADO_WAIT_ACTOR_ID = "nme_ado_wait_sweep";
+
+export type WakeReservationContext = {
+  /** The transaction holding the per-issue advisory lock. */
+  tx: Db;
+  companyId: string;
+  history: WakeHistory;
+  now: Date;
+  /** Insert the nme_ado_wait.wake entry (counts immediately for any concurrent reader after commit). */
+  reserve: (details: Record<string, unknown>) => Promise<void>;
+  /** Log another activity entry on the transaction; published after commit. */
+  log: (action: string, details: Record<string, unknown>) => Promise<void>;
+};
+
+/**
+ * Serializes wake decisions per issue. The callback gates and dispatches while the lock
+ * is held; return keep=false when the dispatch did not happen (skipped), and the reserved
+ * wake entry is deleted in the same transaction. A throw rolls everything back.
+ * Returns null when the issue does not exist.
+ */
+export async function withIssueWakeReservation<T>(
+  db: Db,
+  issueId: string,
+  fn: (ctx: WakeReservationContext) => Promise<{ keep: boolean; value: T }>,
+  opts: { now?: Date } = {},
+): Promise<{ kept: boolean; reserved: boolean; value: T } | null> {
+  const publications: ActivityPublication[] = [];
+  const outcome = await db.transaction(async (rawTx) => {
+    const tx = rawTx as unknown as Db;
+    await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${`nme_ado_wait:${issueId}`}))`);
+    const [issue] = await tx
+      .select({ companyId: issues.companyId })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .limit(1);
+    if (!issue) return null;
+    const now = opts.now ?? new Date();
+    const history = await loadWakeHistory(tx, issue.companyId, issueId, now);
+    let reservedId: string | null = null;
+    let reservedPublication: ActivityPublication | null = null;
+    const write = async (action: string, details: Record<string, unknown>, into: ActivityPublication[]) =>
+      logActivity(tx, {
+        companyId: issue.companyId,
+        actorType: "system",
+        actorId: ADO_WAIT_ACTOR_ID,
+        action,
+        entityType: "issue",
+        entityId: issueId,
+        details,
+      }, into);
+    const ctx: WakeReservationContext = {
+      tx,
+      companyId: issue.companyId,
+      history,
+      now,
+      reserve: async (details) => {
+        if (reservedId) throw new Error("wake already reserved");
+        const pending: ActivityPublication[] = [];
+        reservedId = (await write(ADO_WAIT_ACTIVITY.wake, details, pending)).id;
+        reservedPublication = pending[0] ?? null;
+      },
+      log: async (action, details) => {
+        await write(action, details, publications);
+      },
+    };
+    const result = await fn(ctx);
+    if (reservedId && !result.keep) {
+      await tx.delete(activityLog).where(eq(activityLog.id, reservedId));
+    } else if (reservedId && reservedPublication) {
+      publications.push(reservedPublication);
+    }
+    return { kept: result.keep, reserved: reservedId !== null, value: result.value };
+  });
+  for (const publication of publications) publishActivity(publication);
+  return outcome;
 }
