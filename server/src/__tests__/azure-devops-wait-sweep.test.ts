@@ -344,6 +344,24 @@ describeEmbeddedPostgres("azure devops wait sweep", () => {
     expect(await eventComments(f.issueId)).toHaveLength(1);
   });
 
+  it("does not hold a PR wait for a pending card that also names another PR", async () => {
+    const f = await seed();
+    await setMonitor(f.issueId, { link: PR_URL });
+    const otherPr = PR_URL.replace(/42$/, "43");
+    await db.insert(issueThreadInteractions).values({
+      companyId: f.companyId, issueId: f.issueId, kind: "request_confirmation", status: "pending",
+      continuationPolicy: "wake_assignee_on_accept", requestedResolverPolicy: "board_only",
+      effectiveResolverPolicy: "board_only", title: `Merge ${PR_URL} and ${otherPr}?`,
+      payload: { version: 1, prompt: "Merge both PRs?" },
+    });
+    const deps = spies();
+    await service(deps, fakeClient()).sweep();
+
+    expect(deps.triggerIssueMonitor).toHaveBeenCalledTimes(1);
+    const wakes = await activity(f.issueId, ADO_WAIT_ACTIVITY.wake);
+    expect(wakes.map((w) => (w.details as { reason: string }).reason)).toEqual(["validation_and_review_final"]);
+  });
+
   it("wakes once for review activity with a wait monitor and a pending merge card on the same PR", async () => {
     const f = await seed();
     await setMonitor(f.issueId, { link: PR_URL });

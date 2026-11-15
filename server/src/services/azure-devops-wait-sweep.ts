@@ -213,7 +213,11 @@ async function loadCandidates(db: Db): Promise<Candidate[]> {
   return candidates;
 }
 
-/** Whether a pending, ungoverned merge card on the issue names this PR (the merge sweep's selection). */
+/**
+ * Whether a pending, ungoverned merge card on the issue names exactly this one PR (the merge
+ * sweep's selection). A card naming more PRs is accepted only once all of them merged, so it
+ * must not hold this PR's wait.
+ */
 async function mergeCardPendingForPr(tx: Db, issueId: string, ref: AzureDevOpsPullRequestReference): Promise<boolean> {
   const wanted = adoPullRequestKey(ref);
   const rows = await tx
@@ -224,11 +228,12 @@ async function mergeCardPendingForPr(tx: Db, issueId: string, ref: AzureDevOpsPu
       eq(issueThreadInteractions.kind, "request_confirmation"),
       eq(issueThreadInteractions.status, "pending"),
     ));
-  const matching = rows.filter((row) =>
-    getMergeConfirmationPullRequestReferences(row).some(
+  const matching = rows.filter((row) => {
+    const refs = getMergeConfirmationPullRequestReferences(row);
+    return refs.length > 0 && refs.every(
       (r) => r.host === "dev.azure.com" && adoPullRequestKey(r as AzureDevOpsPullRequestReference) === wanted,
-    ),
-  );
+    );
+  });
   if (matching.length === 0) return false;
   const governed = await tx
     .select({ interactionId: toolActionRequests.interactionId })
