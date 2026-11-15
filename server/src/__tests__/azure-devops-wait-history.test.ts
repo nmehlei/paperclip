@@ -139,7 +139,13 @@ describeEmbeddedPostgres("loadWakeHistory", () => {
       { companyId, issueId, authorType: "system", body: "sweep note", createdAt: h(1.2) },
     ]);
 
-    const history = await loadWakeHistory(db, issueId, now);
+    // other-company rows that reuse this issue id must be ignored
+    await db.insert(activityLog).values(wake(other.companyId, issueId, h(1)));
+    await db.insert(issueComments).values({
+      companyId: other.companyId, issueId: other.issueId, authorUserId: "u", authorType: "user", body: "x", createdAt: h(0.5),
+    });
+
+    const history = await loadWakeHistory(db, companyId, issueId, now);
     expect(history.sweepWakesSinceReset24h).toBe(2);
     expect(history.lastSweepWakeAt).toBe(h(2).toISOString());
     expect(history.quotaPausedUntil).toBeNull();
@@ -148,7 +154,7 @@ describeEmbeddedPostgres("loadWakeHistory", () => {
     await db.insert(issueComments).values({
       companyId, issueId, authorUserId: "board-user", authorType: "user", body: "again", createdAt: h(5),
     });
-    const after = await loadWakeHistory(db, issueId, now);
+    const after = await loadWakeHistory(db, companyId, issueId, now);
     expect(after.sweepWakesSinceReset24h).toBe(1);
   });
 
@@ -169,7 +175,13 @@ describeEmbeddedPostgres("loadWakeHistory", () => {
         createdAt: new Date("2026-11-14T11:00:00Z"),
       },
     ]);
-    const history = await loadWakeHistory(db, issueId, now);
+    // a newer quota failure of another company on the same issue id is ignored
+    const other = await seed();
+    await db.insert(heartbeatRuns).values({
+      companyId: other.companyId, agentId: other.agentId, issueId: other.issueId, scopeKind: "issue",
+      contextSnapshot: { issueId }, status: "succeeded", finishedAt: new Date("2026-11-14T11:55:00Z"), createdAt: new Date("2026-11-14T11:55:00Z"),
+    });
+    const history = await loadWakeHistory(db, companyId, issueId, now);
     // latest run has no parsable reset: finishedAt + 5 h
     expect(history.quotaPausedUntil).toBe("2026-11-14T16:30:00.000Z");
   });
@@ -182,7 +194,7 @@ describeEmbeddedPostgres("loadWakeHistory", () => {
       { companyId, agentId, issueId, scopeKind: "issue", status: "succeeded",
         finishedAt: new Date("2026-11-14T10:00:00Z"), createdAt: new Date("2026-11-14T10:00:00Z") },
     ]);
-    const history = await loadWakeHistory(db, issueId, new Date("2026-11-14T12:00:00Z"));
+    const history = await loadWakeHistory(db, companyId, issueId, new Date("2026-11-14T12:00:00Z"));
     expect(history.quotaPausedUntil).toBeNull();
   });
 });

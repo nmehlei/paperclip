@@ -53,13 +53,14 @@ export function parseQuotaReset(error: string | null, now: Date): Date | null {
   return null;
 }
 
-export async function loadWakeHistory(db: Db, issueId: string, now: Date): Promise<WakeHistory> {
+export async function loadWakeHistory(db: Db, companyId: string, issueId: string, now: Date): Promise<WakeHistory> {
   // Only a comment by a human board user resets the cap. Agent comments and
   // system notices (including the sweep's own) never do.
   const [lastHuman] = await db
     .select({ createdAt: issueComments.createdAt })
     .from(issueComments)
     .where(and(
+      eq(issueComments.companyId, companyId),
       eq(issueComments.issueId, issueId),
       isNull(issueComments.deletedAt),
       sql`${issueComments.authorUserId} is not null`,
@@ -76,6 +77,7 @@ export async function loadWakeHistory(db: Db, issueId: string, now: Date): Promi
     .select({ createdAt: activityLog.createdAt })
     .from(activityLog)
     .where(and(
+      eq(activityLog.companyId, companyId),
       eq(activityLog.action, ADO_WAIT_ACTIVITY.wake),
       eq(activityLog.entityType, "issue"),
       eq(activityLog.entityId, issueId),
@@ -84,21 +86,33 @@ export async function loadWakeHistory(db: Db, issueId: string, now: Date): Promi
     .orderBy(desc(activityLog.createdAt));
 
   // Runs link to an issue through the issue_id column; older rows only carry it
-  // in the context snapshot.
-  const [latestRun] = await db
-    .select({
-      status: heartbeatRuns.status,
-      errorCode: heartbeatRuns.errorCode,
-      error: heartbeatRuns.error,
-      finishedAt: heartbeatRuns.finishedAt,
-    })
+  // in the context snapshot. Two index-backed lookups (both lead with company_id),
+  // newest by created_at wins.
+  const runColumns = {
+    status: heartbeatRuns.status,
+    errorCode: heartbeatRuns.errorCode,
+    error: heartbeatRuns.error,
+    finishedAt: heartbeatRuns.finishedAt,
+    createdAt: heartbeatRuns.createdAt,
+  };
+  const [byColumn] = await db
+    .select(runColumns)
     .from(heartbeatRuns)
-    .where(or(
-      eq(heartbeatRuns.issueId, issueId),
-      sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
-    ))
-    .orderBy(desc(sql`coalesce(${heartbeatRuns.finishedAt}, ${heartbeatRuns.createdAt})`))
+    .where(and(eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.issueId, issueId)))
+    .orderBy(desc(heartbeatRuns.createdAt))
     .limit(1);
+  const [bySnapshot] = await db
+    .select(runColumns)
+    .from(heartbeatRuns)
+    .where(and(
+      eq(heartbeatRuns.companyId, companyId),
+      sql`(${heartbeatRuns.contextSnapshot} ->> 'issueId') = ${issueId}`,
+    ))
+    .orderBy(desc(heartbeatRuns.createdAt))
+    .limit(1);
+  const latestRun = byColumn && bySnapshot
+    ? (bySnapshot.createdAt > byColumn.createdAt ? bySnapshot : byColumn)
+    : (byColumn ?? bySnapshot);
 
   let quotaPausedUntil: string | null = null;
   if (latestRun && isQuotaFailure(latestRun)) {
