@@ -31,11 +31,21 @@ export type WaitWakeReason =
   | "pipeline_finished";
 
 export type WaitDecision =
-  | { action: "wake"; reason: WaitWakeReason; summary: string; activityAt?: string }
+  | {
+      action: "wake";
+      reason: WaitWakeReason;
+      summary: string;
+      activityAt?: string;
+      /** Monitor wakes: what was delivered (PR source commit, PR status, build id); stored on the wake entry. */
+      identity?: string;
+    }
   | { action: "pause"; pendingEvent: WaitWakeReason }
   | { action: "extend_backstop" }
   | { action: "hold"; reason: "quota" | "quiet_period" }
   | { action: "none" };
+
+/** Identity of the newest delivered wake per reason for one wait link. */
+export type DeliveredWakes = Partial<Record<WaitWakeReason, string>>;
 
 export function gateWake(history: WakeHistory, now: Date): "ok" | "quota" | "cap" {
   if (history.quotaPausedUntil) {
@@ -142,8 +152,15 @@ export function decideWait(input: {
   monitorPendingForSamePr: boolean;
   monitorNextCheckAt: string | null;
   now: Date;
+  /** Monitor subjects: the event already delivered for this link, so a re-parked wait does not fire again. */
+  delivered?: DeliveredWakes;
+  /** Monitor subjects: a pending merge card on the same PR means the PR is already handed over. */
+  mergeCardPendingForSamePr?: boolean;
 }): WaitDecision {
   const { subject, history, config, organization, now } = input;
+  const delivered = input.delivered ?? {};
+  const fire = (event: WaitDecision & { action: "wake" }): WaitDecision =>
+    event.identity !== undefined && delivered[event.reason] === event.identity ? NONE : gate(event, history, now);
 
   if (subject.source === "merge_card") {
     const pr = input.pr;
@@ -170,22 +187,23 @@ export function decideWait(input: {
     const pr = input.pr;
     if (!pr) return NONE;
     if (pr.status === "completed" || pr.status === "abandoned") {
-      return gate(
-        { action: "wake", reason: "pr_closed", summary: summarize(`PR ${target.ref.number} ${pr.status}. ${prUrl(target.ref)}`) },
-        history,
-        now,
-      );
+      // The merge sweep accepts the pending card and wakes with merge_accepted.
+      if (pr.status === "completed" && input.mergeCardPendingForSamePr) return NONE;
+      return fire({
+        action: "wake",
+        reason: "pr_closed",
+        identity: pr.status,
+        summary: summarize(`PR ${target.ref.number} ${pr.status}. ${prUrl(target.ref)}`),
+      });
     }
+    if (input.mergeCardPendingForSamePr) return NONE;
     if (validationFinal(pr) && aiReviewIn(pr, config, organization, now)) {
-      return gate(
-        {
-          action: "wake",
-          reason: "validation_and_review_final",
-          summary: summarize(`PR ${target.ref.number} validation and AI review are final. ${prUrl(target.ref)}`),
-        },
-        history,
-        now,
-      );
+      return fire({
+        action: "wake",
+        reason: "validation_and_review_final",
+        ...(pr.lastMergeSourceCommit ? { identity: pr.lastMergeSourceCommit } : {}),
+        summary: summarize(`PR ${target.ref.number} validation and AI review are final. ${prUrl(target.ref)}`),
+      });
     }
     return NONE;
   }
@@ -193,17 +211,14 @@ export function decideWait(input: {
   const build = input.build;
   if (!build) return NONE;
   if (build.status === "completed") {
-    return gate(
-      {
-        action: "wake",
-        reason: "pipeline_finished",
-        summary: summarize(
-          `Build ${target.buildId} finished: ${build.result ?? "unknown"}. ${buildUrl(target.organization, target.project, target.buildId)}`,
-        ),
-      },
-      history,
-      now,
-    );
+    return fire({
+      action: "wake",
+      reason: "pipeline_finished",
+      identity: String(target.buildId),
+      summary: summarize(
+        `Build ${target.buildId} finished: ${build.result ?? "unknown"}. ${buildUrl(target.organization, target.project, target.buildId)}`,
+      ),
+    });
   }
   if (build.waitingOnApproval) {
     const next = ms(input.monitorNextCheckAt);

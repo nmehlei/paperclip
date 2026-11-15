@@ -67,6 +67,8 @@ function run(input: {
   pending?: boolean;
   nextCheck?: string | null;
   now?: Date;
+  delivered?: Parameters<typeof decideWait>[0]["delivered"];
+  mergeCard?: boolean;
 }) {
   return decideWait({
     subject: input.subject ?? monitor,
@@ -78,6 +80,8 @@ function run(input: {
     monitorPendingForSamePr: input.pending ?? false,
     monitorNextCheckAt: input.nextCheck ?? null,
     now: input.now ?? NOW,
+    delivered: input.delivered,
+    mergeCardPendingForSamePr: input.mergeCard,
   });
 }
 
@@ -230,6 +234,42 @@ describe("azure devops wait decision", () => {
     expect(run({ subject: buildSubject, build, nextCheck: far })).toEqual({ action: "none" });
     const done = { status: "completed" as const, result: "succeeded", waitingOnApproval: false };
     expect(run({ subject: buildSubject, build: done })).toMatchObject({ action: "wake", reason: "pipeline_finished" });
+  });
+
+  it("does not re-fire a wait on an unchanged final PR", () => {
+    expect(run({ pr: pr() })).toMatchObject({ action: "wake", reason: "validation_and_review_final", identity: "src2" });
+    expect(run({ pr: pr(), delivered: { validation_and_review_final: "src2" } })).toEqual({ action: "none" });
+    const closed = pr({ status: "completed" });
+    expect(run({ pr: closed })).toMatchObject({ action: "wake", reason: "pr_closed", identity: "completed" });
+    expect(run({ pr: closed, delivered: { pr_closed: "completed" } })).toEqual({ action: "none" });
+    expect(run({ pr: closed, delivered: { validation_and_review_final: "src2" } })).toMatchObject({ action: "wake", reason: "pr_closed" });
+  });
+
+  it("fires again after a new push changes the source commit", () => {
+    expect(run({ pr: pr(), delivered: { validation_and_review_final: "src1" } })).toMatchObject({
+      action: "wake",
+      reason: "validation_and_review_final",
+      identity: "src2",
+    });
+  });
+
+  it("does not re-fire on the same finished build", () => {
+    const done = { status: "completed" as const, result: "succeeded", waitingOnApproval: false };
+    const subject = (buildId: number): WaitSubject => ({
+      source: "monitor",
+      issueId: "i3",
+      target: { kind: "build", organization: "pharao2k", project: "NME", buildId },
+    });
+    expect(run({ subject: subject(4690), build: done })).toMatchObject({ action: "wake", reason: "pipeline_finished", identity: "4690" });
+    expect(run({ subject: subject(4690), build: done, delivered: { pipeline_finished: "4690" } })).toEqual({ action: "none" });
+    expect(run({ subject: subject(4691), build: done, delivered: { pipeline_finished: "4690" } }).action).toBe("wake");
+  });
+
+  it("holds validation_and_review_final while a merge card on the same PR is pending", () => {
+    expect(run({ pr: pr(), mergeCard: true })).toEqual({ action: "none" });
+    // A completed PR is reported by the merge sweep as merge_accepted; an abandoned one still wakes.
+    expect(run({ pr: pr({ status: "completed" }), mergeCard: true })).toEqual({ action: "none" });
+    expect(run({ pr: pr({ status: "abandoned" }), mergeCard: true })).toMatchObject({ action: "wake", reason: "pr_closed" });
   });
 
   it("never fires on an unknown snapshot", () => {
