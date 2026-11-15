@@ -137,6 +137,37 @@ describe("pr()", () => {
     expect((await client(fn).pr("c1", ref))?.hasBuildPolicy).toBe(false);
   });
 
+  it("drops evaluations of optional (non-blocking) build policies", async () => {
+    const { fn } = router(prRoutes({
+      "/_apis/policy/evaluations": () => json({ value: [
+        { status: "approved", configuration: { isBlocking: true, type: { id: ADO_BUILD_POLICY_TYPE_ID } }, context: { buildId: 77, isExpired: false } },
+        { status: "queued", configuration: { isBlocking: false, type: { id: ADO_BUILD_POLICY_TYPE_ID } }, context: { buildId: 0, isExpired: false } },
+      ] }),
+    }));
+    expect((await client(fn).pr("c1", ref))?.evaluations).toEqual([
+      { status: "approved", isExpired: false, buildId: 77, buildSourceSha: "src1", buildSourceVersion: "merge1" },
+    ]);
+  });
+
+  it("ignores deleted comments and deleted threads", async () => {
+    const { fn } = router(prRoutes({
+      "/pullrequests/1556/threads": () => json({ value: [
+        { id: 1, comments: [
+          { author: { uniqueName: "a@x" }, parentCommentId: 0, commentType: "text", publishedDate: "2026-11-13T10:00:00Z", lastUpdatedDate: "2026-11-13T10:00:00Z" },
+          { author: { uniqueName: "b@x" }, parentCommentId: 1, commentType: "text", isDeleted: true, publishedDate: "2026-11-13T11:00:00Z", lastUpdatedDate: "2026-11-13T12:00:00Z" },
+        ] },
+        { id: 2, isDeleted: true, comments: [
+          { author: { uniqueName: "c@x" }, parentCommentId: 0, commentType: "text", publishedDate: "2026-11-14T10:00:00Z", lastUpdatedDate: "2026-11-14T10:00:00Z" },
+        ] },
+      ] }),
+    }));
+    expect((await client(fn).pr("c1", ref))?.threads).toEqual([
+      { id: 1, vote: null, comments: [
+        { authorUniqueName: "a@x", parentCommentId: 0, commentType: "text", publishedAt: "2026-11-13T10:00:00Z", lastUpdatedAt: "2026-11-13T10:00:00Z" },
+      ] },
+    ]);
+  });
+
   it("queries the git-area policy configurations endpoint", async () => {
     const { fn, calls } = router(prRoutes());
     await client(fn).pr("c1", ref);

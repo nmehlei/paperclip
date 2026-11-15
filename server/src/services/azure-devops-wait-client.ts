@@ -191,8 +191,8 @@ export function createAdoWaitClient(
 
     const threads: AdoThread[] = [];
     for (const item of arr(threadBody.value)) {
-      if (!isRec(item) || typeof item.id !== "number") continue;
-      const comments: AdoComment[] = arr(item.comments).filter(isRec).map((c) => ({
+      if (!isRec(item) || typeof item.id !== "number" || item.isDeleted === true) continue;
+      const comments: AdoComment[] = arr(item.comments).filter(isRec).filter((c) => c.isDeleted !== true).map((c) => ({
         authorUniqueName: isRec(c.author) ? (str(c.author.uniqueName) ?? "") : "",
         parentCommentId: typeof c.parentCommentId === "number" ? c.parentCommentId : 0,
         commentType: str(c.commentType) ?? "",
@@ -220,6 +220,8 @@ export function createAdoWaitClient(
       if (!isRec(item)) continue;
       const type = isRec(item.configuration) && isRec(item.configuration.type) ? item.configuration.type.id : null;
       if (typeof type !== "string" || type.toLowerCase() !== ADO_BUILD_POLICY_TYPE_ID) continue;
+      // An optional build policy can stay queued forever; it never gates the merge.
+      if (isRec(item.configuration) && item.configuration.isBlocking === false) continue;
       const context = isRec(item.context) ? item.context : {};
       const buildId = typeof context.buildId === "number" && context.buildId > 0 ? context.buildId : null;
       let buildSourceSha: string | null = null;
