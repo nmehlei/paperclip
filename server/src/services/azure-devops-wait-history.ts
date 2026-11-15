@@ -1,7 +1,7 @@
 import { and, desc, eq, gt, isNull, or, sql } from "drizzle-orm";
 import { activityLog, heartbeatRuns, issueComments, issues, type Db } from "@paperclipai/db";
 import { logActivity, publishActivity, type ActivityPublication } from "./activity-log.js";
-import type { WakeHistory } from "./azure-devops-wait-decision.js";
+import type { DeliveredWakes, WaitWakeReason, WakeHistory } from "./azure-devops-wait-decision.js";
 
 export const ADO_WAIT_ACTIVITY = {
   wake: "nme_ado_wait.wake",
@@ -171,6 +171,39 @@ export async function loadWakeHistory(db: Db, companyId: string, issueId: string
     lastSweepWakeAt: wakes[0]?.createdAt.toISOString() ?? null,
     quotaPausedUntil,
   };
+}
+
+/**
+ * The identity recorded on the newest wake entry per reason for one wait link (no time
+ * window: a re-parked wait must not fire again on the same event days later).
+ */
+export async function loadDeliveredWakes(
+  db: Db,
+  companyId: string,
+  issueId: string,
+  link: string,
+): Promise<DeliveredWakes> {
+  const rows = await db
+    .select({ details: activityLog.details })
+    .from(activityLog)
+    .where(and(
+      eq(activityLog.companyId, companyId),
+      eq(activityLog.action, ADO_WAIT_ACTIVITY.wake),
+      eq(activityLog.entityType, "issue"),
+      eq(activityLog.entityId, issueId),
+      sql`${activityLog.details} ->> 'link' = ${link}`,
+    ))
+    .orderBy(desc(activityLog.createdAt))
+    .limit(50);
+  const delivered: DeliveredWakes = {};
+  const seen = new Set<string>();
+  for (const row of rows) {
+    const details = (row.details ?? {}) as { reason?: unknown; identity?: unknown };
+    if (typeof details.reason !== "string" || seen.has(details.reason)) continue;
+    seen.add(details.reason);
+    if (typeof details.identity === "string") delivered[details.reason as WaitWakeReason] = details.identity;
+  }
+  return delivered;
 }
 
 export const ADO_WAIT_ACTOR_ID = "nme_ado_wait_sweep";

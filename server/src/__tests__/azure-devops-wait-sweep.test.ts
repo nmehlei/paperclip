@@ -195,12 +195,58 @@ describeEmbeddedPostgres("azure devops wait sweep", () => {
     await sweep.sweep();
     expect(await eventComments(f.issueId)).toHaveLength(0);
     await sweep.sweep();
-    await sweep.sweep();
     const comments = await eventComments(f.issueId);
-    expect(comments.map((c) => c.body)).toEqual([
-      `Event: Build 4690 finished: succeeded. ${BUILD_URL(4690)}`,
-      `Event: Build 4690 finished: succeeded. ${BUILD_URL(4690)}`,
-    ]);
+    expect(comments.map((c) => c.body)).toEqual([`Event: Build 4690 finished: succeeded. ${BUILD_URL(4690)}`]);
+  });
+
+  it("does not re-fire a re-parked wait on the same finished build", async () => {
+    const f = await seed();
+    await setMonitor(f.issueId, { link: BUILD_URL(4700) });
+    const deps = spies();
+    const sweep = service(deps, fakeClient());
+
+    expect((await sweep.sweep()).woken).toBe(1);
+    const [wake] = await activity(f.issueId, ADO_WAIT_ACTIVITY.wake);
+    expect(wake!.details).toEqual({ reason: "pipeline_finished", link: BUILD_URL(4700), identity: "4700" });
+    await setMonitor(f.issueId, { link: BUILD_URL(4700) });
+    expect(await sweep.sweep()).toEqual({ checked: 1, woken: 0, paused: 0, extended: 0 });
+    expect(deps.triggerIssueMonitor).toHaveBeenCalledTimes(1);
+    expect(await eventComments(f.issueId)).toHaveLength(1);
+  });
+
+  it("re-fires a PR wait only after a new push changes the source commit", async () => {
+    const f = await seed();
+    await setMonitor(f.issueId, { link: PR_URL });
+    let pr = finalPr({ lastMergeSourceCommit: "c1" });
+    const client = fakeClient();
+    client.pr.mockImplementation(async () => pr);
+    const deps = spies();
+    const sweep = service(deps, client);
+
+    expect((await sweep.sweep()).woken).toBe(1);
+    expect((await sweep.sweep()).woken).toBe(0);
+    pr = finalPr({ lastMergeSourceCommit: "c2" });
+    expect((await sweep.sweep()).woken).toBe(1);
+    const wakes = await activity(f.issueId, ADO_WAIT_ACTIVITY.wake);
+    expect(wakes.map((w) => (w.details as { identity: string }).identity).sort()).toEqual(["c1", "c2"]);
+  });
+
+  it("holds a final PR wait while a merge card on the same PR is pending", async () => {
+    const f = await seed();
+    await setMonitor(f.issueId, { link: PR_URL });
+    await db.insert(issueThreadInteractions).values({
+      companyId: f.companyId, issueId: f.issueId, kind: "request_confirmation", status: "pending",
+      continuationPolicy: "wake_assignee_on_accept", requestedResolverPolicy: "board_only",
+      effectiveResolverPolicy: "board_only", title: `Merge ${PR_URL}?`,
+      payload: { version: 1, prompt: "Merge the PR?" },
+    });
+    const deps = spies();
+    const result = await service(deps, fakeClient()).sweep();
+
+    expect(result.woken).toBe(0);
+    expect(deps.triggerIssueMonitor).not.toHaveBeenCalled();
+    expect(deps.wakeup).not.toHaveBeenCalled();
+    expect(await activity(f.issueId, ADO_WAIT_ACTIVITY.wake)).toHaveLength(0);
   });
 
   it("counts only triggered monitor wakes", async () => {
@@ -297,6 +343,46 @@ describeEmbeddedPostgres("azure devops wait sweep", () => {
     expect(await eventComments(f.issueId)).toHaveLength(1);
   });
 
+  it("skips a merge-card wake when the card or the assignee changed after the candidate load", async () => {
+    const f = await seed();
+    const other = await db.insert(agents).values({
+      companyId: f.companyId, name: "Marco", role: "engineer", status: "active",
+      adapterType: "codex_local", adapterConfig: {}, runtimeConfig: {}, permissions: {},
+    }).returning();
+    const activityAt = new Date(Date.now() - 30 * 60_000).toISOString();
+    const [card] = await db.insert(issueThreadInteractions).values({
+      companyId: f.companyId, issueId: f.issueId, kind: "request_confirmation", status: "pending",
+      continuationPolicy: "wake_assignee_on_accept", requestedResolverPolicy: "board_only",
+      effectiveResolverPolicy: "board_only", title: `Merge ${PR_URL}?`,
+      payload: { version: 1, prompt: "Merge the PR?" }, createdAt: new Date(Date.now() - 2 * HOUR),
+    }).returning();
+    const pr = finalPr({
+      threads: [{
+        id: 1, vote: null,
+        comments: [{ authorUniqueName: "nicolas@example.com", parentCommentId: 0, commentType: "text", publishedAt: activityAt, lastUpdatedAt: activityAt }],
+      }],
+    });
+    const changes: Array<() => Promise<unknown>> = [
+      () => db.update(issueThreadInteractions).set({ status: "accepted" }).where(eq(issueThreadInteractions.id, card!.id)),
+      () => db.update(issues).set({ assigneeAgentId: other[0]!.id }).where(eq(issues.id, f.issueId)),
+      () => db.update(issues).set({ assigneeAgentId: null, assigneeUserId: "user-1" }).where(eq(issues.id, f.issueId)),
+    ];
+    for (const change of changes) {
+      await db.update(issueThreadInteractions).set({ status: "pending" }).where(eq(issueThreadInteractions.id, card!.id));
+      await db.update(issues).set({ assigneeAgentId: f.agentId, assigneeUserId: null }).where(eq(issues.id, f.issueId));
+      const client = fakeClient();
+      client.pr.mockImplementation(async () => {
+        await change();
+        return pr;
+      });
+      const deps = spies();
+      expect(await service(deps, client).sweep()).toMatchObject({ checked: 1, woken: 0 });
+      expect(deps.wakeup).not.toHaveBeenCalled();
+    }
+    expect(await activity(f.issueId, ADO_WAIT_ACTIVITY.wake)).toHaveLength(0);
+    expect(await eventComments(f.issueId)).toHaveLength(0);
+  });
+
   it("logs one paused entry, no comment and no wake at the cap", async () => {
     const f = await seed();
     await setMonitor(f.issueId, { link: BUILD_URL(9) });
@@ -335,14 +421,20 @@ describeEmbeddedPostgres("azure devops wait sweep", () => {
     expect(deps.triggerIssueMonitor).not.toHaveBeenCalled();
   });
 
-  it("skips issues assigned to a user or closed, and survives a conflict", async () => {
+  it("skips issues assigned to a user, closed, todo or blocked, and survives a conflict", async () => {
     const f = await seed();
     const userIssue = await addIssue(f.companyId, f.agentId);
     const doneIssue = await addIssue(f.companyId, f.agentId);
-    const goodIssue = await addIssue(f.companyId, f.agentId);
-    for (const id of [f.issueId, userIssue.id, doneIssue.id, goodIssue.id]) await setMonitor(id, { link: BUILD_URL(20) });
+    const todoIssue = await addIssue(f.companyId, f.agentId);
+    const blockedIssue = await addIssue(f.companyId, f.agentId);
+    const goodIssue = await addIssue(f.companyId, f.agentId, { status: "in_progress" });
+    for (const id of [f.issueId, userIssue.id, doneIssue.id, todoIssue.id, blockedIssue.id, goodIssue.id]) {
+      await setMonitor(id, { link: BUILD_URL(20) });
+    }
     await db.update(issues).set({ assigneeAgentId: null, assigneeUserId: "user-1" }).where(eq(issues.id, userIssue.id));
     await db.update(issues).set({ status: "done" }).where(eq(issues.id, doneIssue.id));
+    await db.update(issues).set({ status: "todo" }).where(eq(issues.id, todoIssue.id));
+    await db.update(issues).set({ status: "blocked" }).where(eq(issues.id, blockedIssue.id));
     const deps = spies();
     deps.triggerIssueMonitor.mockImplementation((async (issueId: string) => {
       if (issueId === f.issueId) throw conflict("Issue monitor check is already in progress");
@@ -399,10 +491,11 @@ describeEmbeddedPostgres("azure devops wait sweep", () => {
     const results = await Promise.all([service(deps, client).sweep(), service(deps, client).sweep()]);
 
     expect(results.reduce((sum, r) => sum + r.woken, 0)).toBe(1);
-    expect(results.reduce((sum, r) => sum + r.paused, 0)).toBe(1);
+    // The second sweep waits for the lock, then sees build 40 already delivered (before the cap).
+    expect(results.reduce((sum, r) => sum + r.paused, 0)).toBe(0);
     expect(deps.triggerIssueMonitor).toHaveBeenCalledTimes(1);
     expect(await activity(f.issueId, ADO_WAIT_ACTIVITY.wake)).toHaveLength(6);
-    expect(await activity(f.issueId, ADO_WAIT_ACTIVITY.pause)).toHaveLength(1);
+    expect(await activity(f.issueId, ADO_WAIT_ACTIVITY.pause)).toHaveLength(0);
   });
 
   it("does nothing when NME_ADO_WAIT_SWEEP is off", async () => {

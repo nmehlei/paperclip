@@ -32,6 +32,7 @@ import {
   ADO_WAIT_ACTIVITY,
   ADO_WAIT_ACTOR_ID,
   adoWaitSweepDisabled,
+  loadDeliveredWakes,
   logPausedOnce,
   withIssueWakeReservation,
 } from "./azure-devops-wait-history.js";
@@ -45,6 +46,8 @@ export const ADO_WAIT_SERVICE_NAME = "nme_ado_wait";
 
 const BACKSTOP_TIMEOUT_MS = 7 * 24 * 3600_000;
 const CLOSED_STATUSES = ["done", "cancelled"];
+/** Same statuses triggerIssueMonitor accepts; other monitors cannot be woken. */
+const MONITOR_STATUSES = ["in_progress", "in_review"];
 
 type AdoWaitClient = Pick<ReturnType<typeof createAdoWaitClient>, "pr" | "build" | "probe">;
 
@@ -138,6 +141,8 @@ type Candidate = {
   companyId: string;
   agentId: string;
   subject: WaitSubject;
+  /** Merge-card subjects: the card, re-read inside the reservation. */
+  interactionId: string | null;
   organization: string;
   link: string;
   monitorNextCheckAt: string | null;
@@ -162,6 +167,7 @@ async function loadCandidates(db: Db): Promise<Candidate[]> {
     .from(issues)
     .where(and(
       assignable,
+      inArray(issues.status, MONITOR_STATUSES),
       isNotNull(issues.monitorNextCheckAt),
       sql`${issues.executionPolicy} -> 'monitor' ->> 'serviceName' = ${ADO_WAIT_SERVICE_NAME}`,
     ));
@@ -182,6 +188,7 @@ async function loadCandidates(db: Db): Promise<Candidate[]> {
       companyId: row.companyId,
       agentId: row.agentId,
       subject: { source: "monitor", issueId: row.id, target },
+      interactionId: null,
       organization: target.kind === "pr" ? target.ref.organization : target.organization,
       link: targetLink(target),
       monitorNextCheckAt: row.monitorNextCheckAt?.toISOString() ?? null,
@@ -227,6 +234,7 @@ async function loadCandidates(db: Db): Promise<Candidate[]> {
             ref,
             cardCreatedAt: card.interaction.createdAt.toISOString(),
           },
+          interactionId: card.interaction.id,
           organization: ref.organization,
           link: targetLink({ kind: "pr", ref }),
           monitorNextCheckAt: null,
@@ -236,6 +244,48 @@ async function loadCandidates(db: Db): Promise<Candidate[]> {
     }
   }
   return candidates;
+}
+
+/** Whether a pending, ungoverned merge card on the issue names this PR (the merge sweep's selection). */
+async function mergeCardPendingForPr(tx: Db, issueId: string, ref: AzureDevOpsPullRequestReference): Promise<boolean> {
+  const wanted = prKey(ref);
+  const rows = await tx
+    .select()
+    .from(issueThreadInteractions)
+    .where(and(
+      eq(issueThreadInteractions.issueId, issueId),
+      eq(issueThreadInteractions.kind, "request_confirmation"),
+      eq(issueThreadInteractions.status, "pending"),
+    ));
+  const matching = rows.filter((row) =>
+    getMergeConfirmationPullRequestReferences(row).some(
+      (r) => r.host === "dev.azure.com" && prKey(r as AzureDevOpsPullRequestReference) === wanted,
+    ),
+  );
+  if (matching.length === 0) return false;
+  const governed = await tx
+    .select({ interactionId: toolActionRequests.interactionId })
+    .from(toolActionRequests)
+    .where(inArray(toolActionRequests.interactionId, matching.map((row) => row.id)));
+  const governedIds = new Set(governed.map((row) => row.interactionId));
+  return matching.some((row) => !governedIds.has(row.id));
+}
+
+/** Merge-card subjects: the card is still pending and the issue still belongs to the same agent. */
+async function mergeCardStillCurrent(tx: Db, candidate: Candidate): Promise<boolean> {
+  if (!candidate.interactionId) return false;
+  const [issue] = await tx
+    .select({ assigneeAgentId: issues.assigneeAgentId, assigneeUserId: issues.assigneeUserId })
+    .from(issues)
+    .where(eq(issues.id, candidate.issueId))
+    .limit(1);
+  if (!issue || issue.assigneeUserId || issue.assigneeAgentId !== candidate.agentId) return false;
+  const [card] = await tx
+    .select({ status: issueThreadInteractions.status })
+    .from(issueThreadInteractions)
+    .where(eq(issueThreadInteractions.id, candidate.interactionId))
+    .limit(1);
+  return card?.status === "pending";
 }
 
 /** Lock + prepareIssueMonitorUpdate + write, as the runner tool's set_task_monitor does, as system actor. */
@@ -341,7 +391,20 @@ export function azureDevOpsWaitSweepService(
   async function processCandidate(candidate: Candidate, config: AdoWaitConfig) {
     const snapshot: { pr?: AdoPrSnapshot | null; build?: AdoBuildSnapshot | null } = await readSnapshot(candidate);
     const outcome = await withIssueWakeReservation<CandidateOutcome>(db, candidate.issueId, async (ctx) => {
+      const subject = candidate.subject;
+      if (subject.source === "merge_card" && !(await mergeCardStillCurrent(ctx.tx, candidate))) {
+        return { keep: false, value: { action: "none" as const } };
+      }
+      const monitorInputs = subject.source === "monitor"
+        ? {
+            delivered: await loadDeliveredWakes(ctx.tx, ctx.companyId, candidate.issueId, candidate.link),
+            mergeCardPendingForSamePr: subject.target.kind === "pr"
+              ? await mergeCardPendingForPr(ctx.tx, candidate.issueId, subject.target.ref)
+              : false,
+          }
+        : {};
       const decision = decideWait({
+        ...monitorInputs,
         subject: candidate.subject,
         pr: snapshot.pr,
         build: snapshot.build,
@@ -353,7 +416,11 @@ export function azureDevOpsWaitSweepService(
         now: ctx.now,
       });
       if (decision.action === "wake") {
-        await ctx.reserve({ reason: decision.reason, link: candidate.link });
+        await ctx.reserve({
+          reason: decision.reason,
+          link: candidate.link,
+          ...(decision.identity !== undefined ? { identity: decision.identity } : {}),
+        });
         const kept = await dispatch(candidate, decision.summary, decision.activityAt);
         return { keep: kept, value: { action: "wake" as const, summary: decision.summary } };
       }
