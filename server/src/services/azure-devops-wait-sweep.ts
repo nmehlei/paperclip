@@ -40,8 +40,6 @@ import {
 } from "./azure-devops-wait-history.js";
 import { normalizeIssueExecutionPolicy } from "./issue-execution-policy.js";
 import { prepareIssueMonitorUpdate } from "./issue-monitors.js";
-import { getMergeConfirmationPullRequestReferences } from "./issue-thread-interactions.js";
-import { issueService } from "./issues.js";
 import { secretService } from "./secrets.js";
 
 export { ADO_WAIT_SERVICE_NAME, resolveAdoWaitTarget };
@@ -177,6 +175,7 @@ async function loadCandidates(db: Db): Promise<Candidate[]> {
       eq(issueThreadInteractions.status, "pending"),
       assignable,
     ));
+  const getMergeConfirmationPullRequestReferences = await loadMergeConfirmationReferences();
   const cards = cardRows.flatMap((row) => {
     const refs = getMergeConfirmationPullRequestReferences(row.interaction).filter(
       (ref): ref is AzureDevOpsPullRequestReference => ref.host === "dev.azure.com",
@@ -228,6 +227,7 @@ async function mergeCardPendingForPr(tx: Db, issueId: string, ref: AzureDevOpsPu
       eq(issueThreadInteractions.kind, "request_confirmation"),
       eq(issueThreadInteractions.status, "pending"),
     ));
+  const getMergeConfirmationPullRequestReferences = await loadMergeConfirmationReferences();
   const matching = rows.filter((row) => {
     const refs = getMergeConfirmationPullRequestReferences(row);
     return refs.length > 0 && refs.every(
@@ -304,6 +304,12 @@ export function adoWaitMonitorUpdater(db: Db): UpdateIssueMonitor {
   };
 }
 
+// Loaded lazily: issue-thread-interactions.js pulls in issues.js and the document tables, which callers
+// that mock @paperclipai/db (the server startup test) do not provide.
+async function loadMergeConfirmationReferences() {
+  return (await import("./issue-thread-interactions.js")).getMergeConfirmationPullRequestReferences;
+}
+
 export function azureDevOpsWaitSweepService(
   db: Db,
   deps: {
@@ -313,11 +319,16 @@ export function azureDevOpsWaitSweepService(
     client?: AdoWaitClient;
     config?: AdoWaitConfig;
     now?: () => Date;
+    addComment?: (issueId: string, body: string) => Promise<unknown>;
   },
 ) {
   const client = deps.client ?? createAdoWaitClient(db);
   const now = deps.now ?? (() => new Date());
-  const issuesSvc = issueService(db);
+  // issues.js is loaded lazily so importing this module stays cheap for callers that mock @paperclipai/db.
+  const addComment = deps.addComment ?? (async (issueId: string, body: string) => {
+    const { issueService } = await import("./issues.js");
+    return issueService(db).addComment(issueId, body, {}, { authorType: "system" });
+  });
 
   async function readSnapshot(candidate: Candidate) {
     const s = candidate.subject;
@@ -410,8 +421,7 @@ export function azureDevOpsWaitSweepService(
     }, { now: now() });
     if (outcome?.value.action === "wake" && outcome.kept) {
       // After commit: a failed comment never undoes the wake.
-      await issuesSvc
-        .addComment(candidate.issueId, `Event: ${outcome.value.summary}`, {}, { authorType: "system" })
+      await addComment(candidate.issueId, `Event: ${outcome.value.summary}`)
         .catch((err: unknown) => logger.warn({ err, issueId: candidate.issueId }, "azure devops wait event comment failed"));
     }
     return outcome;

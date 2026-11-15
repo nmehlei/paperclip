@@ -1379,6 +1379,7 @@ async function startServerWithDatabaseTeardown(
       triggerIssueMonitor: (issueId, input) => heartbeat.triggerIssueMonitor(issueId, input),
       updateIssueMonitor: adoWaitMonitorUpdater(db as any),
       wakeup: heartbeat.wakeup,
+      addComment: (issueId, body) => issues.addComment(issueId, body, {}, { authorType: "system" }),
     });
     let azureDevOpsWaitSweepInFlight = false;
     const scheduleAzureDevOpsWaitSweep = () => {
