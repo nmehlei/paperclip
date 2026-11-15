@@ -47,6 +47,8 @@ export type AdoBuildSnapshot = {
   status: "completed" | "inProgress" | "notStarted";
   result: string | null;
   waitingOnApproval: boolean;
+  /** Changes when a retry of the same build finishes again. */
+  finishTime: string | null;
 };
 
 export const ADO_BUILD_POLICY_TYPE_ID = "0609b952-1397-4640-95ec-e00a01b2c241";
@@ -303,7 +305,8 @@ export function createAdoWaitClient(
             : null;
     if (!status) return null;
     const result = str(body.result);
-    if (status === "completed") return { status, result, waitingOnApproval: false };
+    const finishTime = str(body.finishTime);
+    if (status === "completed") return { status, result, waitingOnApproval: false, finishTime };
     const timeline = await getJson(
       companyId,
       target.organization,
@@ -314,7 +317,7 @@ export function createAdoWaitClient(
     const waitingOnApproval = arr(timeline.records).some(
       (r) => isRec(r) && r.state === "inProgress" && r.type === "Checkpoint.Approval",
     );
-    return { status, result, waitingOnApproval };
+    return { status, result, waitingOnApproval, finishTime };
   }
 
   return {

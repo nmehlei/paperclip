@@ -221,7 +221,7 @@ describe("azure devops wait decision", () => {
   });
 
   it("extends the backstop only when it is less than 48 h away", () => {
-    const build = { status: "inProgress" as const, result: null, waitingOnApproval: true };
+    const build = { status: "inProgress" as const, result: null, waitingOnApproval: true, finishTime: null };
     const buildSubject: WaitSubject = {
       source: "monitor",
       issueId: "i3",
@@ -231,37 +231,67 @@ describe("azure devops wait decision", () => {
     const far = iso(NOW.getTime() + 49 * 3_600_000);
     expect(run({ subject: buildSubject, build, nextCheck: soon })).toEqual({ action: "extend_backstop" });
     expect(run({ subject: buildSubject, build, nextCheck: far })).toEqual({ action: "none" });
-    const done = { status: "completed" as const, result: "succeeded", waitingOnApproval: false };
+    const done = { status: "completed" as const, result: "succeeded", waitingOnApproval: false, finishTime: minAgo(5) };
     expect(run({ subject: buildSubject, build: done })).toMatchObject({ action: "wake", reason: "pipeline_finished" });
   });
 
   it("does not re-fire a wait on an unchanged final PR", () => {
-    expect(run({ pr: pr() })).toMatchObject({ action: "wake", reason: "validation_and_review_final", identity: "src2" });
-    expect(run({ pr: pr(), delivered: { validation_and_review_final: "src2" } })).toEqual({ action: "none" });
+    expect(run({ pr: pr() })).toMatchObject({ action: "wake", reason: "validation_and_review_final", identity: "src2|1" });
+    expect(run({ pr: pr(), delivered: { validation_and_review_final: "src2|1" } })).toEqual({ action: "none" });
     const closed = pr({ status: "completed" });
     expect(run({ pr: closed })).toMatchObject({ action: "wake", reason: "pr_closed", identity: "completed" });
     expect(run({ pr: closed, delivered: { pr_closed: "completed" } })).toEqual({ action: "none" });
-    expect(run({ pr: closed, delivered: { validation_and_review_final: "src2" } })).toMatchObject({ action: "wake", reason: "pr_closed" });
+    expect(run({ pr: closed, delivered: { validation_and_review_final: "src2|1" } })).toMatchObject({ action: "wake", reason: "pr_closed" });
   });
 
   it("fires again after a new push changes the source commit", () => {
-    expect(run({ pr: pr(), delivered: { validation_and_review_final: "src1" } })).toMatchObject({
+    expect(run({ pr: pr(), delivered: { validation_and_review_final: "src1|1" } })).toMatchObject({
       action: "wake",
       reason: "validation_and_review_final",
-      identity: "src2",
+      identity: "src2|1",
     });
   });
 
+  it("fires again after a requeued policy build on the same commit", () => {
+    const requeued = pr({
+      evaluations: [
+        { status: "approved", isExpired: false, buildId: 9, buildSourceSha: "src2", buildSourceVersion: null },
+        { status: "approved", isExpired: false, buildId: 12, buildSourceSha: "src2", buildSourceVersion: null },
+      ],
+    });
+    expect(run({ pr: requeued })).toMatchObject({ identity: "src2|9,12" });
+    expect(run({ pr: requeued, delivered: { validation_and_review_final: "src2|9,11" } })).toMatchObject({
+      action: "wake",
+      reason: "validation_and_review_final",
+    });
+    expect(run({ pr: requeued, delivered: { validation_and_review_final: "src2|9,12" } })).toEqual({ action: "none" });
+  });
+
   it("does not re-fire on the same finished build", () => {
-    const done = { status: "completed" as const, result: "succeeded", waitingOnApproval: false };
+    const done = { status: "completed" as const, result: "succeeded", waitingOnApproval: false, finishTime: "2026-11-14T11:00:00Z" };
     const subject = (buildId: number): WaitSubject => ({
       source: "monitor",
       issueId: "i3",
       target: { kind: "build", organization: "pharao2k", project: "NME", buildId },
     });
-    expect(run({ subject: subject(4690), build: done })).toMatchObject({ action: "wake", reason: "pipeline_finished", identity: "4690" });
-    expect(run({ subject: subject(4690), build: done, delivered: { pipeline_finished: "4690" } })).toEqual({ action: "none" });
-    expect(run({ subject: subject(4691), build: done, delivered: { pipeline_finished: "4690" } }).action).toBe("wake");
+    const id = "4690@2026-11-14T11:00:00Z";
+    expect(run({ subject: subject(4690), build: done })).toMatchObject({ action: "wake", reason: "pipeline_finished", identity: id });
+    expect(run({ subject: subject(4690), build: done, delivered: { pipeline_finished: id } })).toEqual({ action: "none" });
+    expect(run({ subject: subject(4691), build: done, delivered: { pipeline_finished: id } }).action).toBe("wake");
+  });
+
+  it("fires again after a retry of the same build finishes", () => {
+    const subject: WaitSubject = {
+      source: "monitor",
+      issueId: "i3",
+      target: { kind: "build", organization: "pharao2k", project: "NME", buildId: 4690 },
+    };
+    const retried = { status: "completed" as const, result: "succeeded", waitingOnApproval: false, finishTime: "2026-11-14T11:40:00Z" };
+    expect(run({ subject, build: retried, delivered: { pipeline_finished: "4690@2026-11-14T11:00:00Z" } })).toMatchObject({
+      action: "wake",
+      reason: "pipeline_finished",
+      identity: "4690@2026-11-14T11:40:00Z",
+    });
   });
 
   it("holds validation_and_review_final while a merge card on the same PR is pending", () => {

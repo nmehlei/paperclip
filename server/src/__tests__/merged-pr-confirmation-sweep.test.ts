@@ -771,7 +771,7 @@ describeEmbeddedPostgres("merged pull-request confirmation sweep", () => {
       wakeup: vi.fn(async () => ({ id: "x" })) as never,
       client: {
         pr: vi.fn(async () => null),
-        build: vi.fn(async () => ({ status: "completed", result: "succeeded", waitingOnApproval: false })),
+        build: vi.fn(async () => ({ status: "completed", result: "succeeded", waitingOnApproval: false, finishTime: "2026-11-14T11:00:00.000Z" })),
         probe: vi.fn(async () => ({ builds: 200, policies: 200 })),
       } as never,
       config: { reviewerOrgs: [], agentIdentities: {} },

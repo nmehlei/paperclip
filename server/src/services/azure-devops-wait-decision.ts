@@ -36,7 +36,7 @@ export type WaitDecision =
       reason: WaitWakeReason;
       summary: string;
       activityAt?: string;
-      /** Monitor wakes: what was delivered (PR source commit, PR status, build id); stored on the wake entry. */
+      /** Monitor wakes: what was delivered (source commit|policy build ids, PR status, build id@finishTime); stored on the wake entry. */
       identity?: string;
     }
   | { action: "pause"; pendingEvent: WaitWakeReason }
@@ -93,6 +93,14 @@ function validationFinal(pr: AdoPrSnapshot): boolean {
     if (e.buildSourceSha !== null) return e.buildSourceSha === pr.lastMergeSourceCommit;
     return e.buildSourceVersion !== null && e.buildSourceVersion === pr.lastMergeCommit;
   });
+}
+
+function policyBuildIds(pr: AdoPrSnapshot): string {
+  return pr.evaluations
+    .map((e) => e.buildId)
+    .filter((id): id is number => id !== null)
+    .sort((a, b) => a - b)
+    .join(",");
 }
 
 function aiReviewIn(pr: AdoPrSnapshot, config: AdoWaitConfig, organization: string, now: Date): boolean {
@@ -203,7 +211,8 @@ export function decideWait(input: {
       return fire({
         action: "wake",
         reason: "validation_and_review_final",
-        ...(pr.lastMergeSourceCommit ? { identity: pr.lastMergeSourceCommit } : {}),
+        // A requeued policy build on the same commit is a new event.
+        ...(pr.lastMergeSourceCommit ? { identity: `${pr.lastMergeSourceCommit}|${policyBuildIds(pr)}` } : {}),
         summary: summarize(`PR ${target.ref.number} validation and AI review are final. ${prUrl(target.ref)}`),
       });
     }
@@ -216,7 +225,8 @@ export function decideWait(input: {
     return fire({
       action: "wake",
       reason: "pipeline_finished",
-      identity: String(target.buildId),
+      // A "retry failed stages" run keeps the build id; its finish time changes.
+      identity: `${target.buildId}@${build.finishTime ?? ""}`,
       summary: summarize(
         `Build ${target.buildId} finished: ${build.result ?? "unknown"}. ${buildUrl(target.organization, target.project, target.buildId)}`,
       ),

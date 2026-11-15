@@ -220,7 +220,7 @@ describe("build()", () => {
       ] }),
       "/builds/4690": () => json({ status: "inProgress" }),
     });
-    expect(await client(fn).build("c1", target)).toEqual({ status: "inProgress", result: null, waitingOnApproval: true });
+    expect(await client(fn).build("c1", target)).toEqual({ status: "inProgress", result: null, waitingOnApproval: true, finishTime: null });
   });
   it("does not treat a plain checkpoint as waiting on approval", async () => {
     const { fn } = router({
@@ -230,8 +230,10 @@ describe("build()", () => {
     expect((await client(fn).build("c1", target))?.waitingOnApproval).toBe(false);
   });
   it("maps a finished build", async () => {
-    const { fn } = router({ "/builds/4690": () => json({ status: "completed", result: "succeeded" }) });
-    expect(await client(fn).build("c1", target)).toEqual({ status: "completed", result: "succeeded", waitingOnApproval: false });
+    const { fn } = router({ "/builds/4690": () => json({ status: "completed", result: "succeeded", finishTime: "2026-11-14T11:00:00.123Z" }) });
+    expect(await client(fn).build("c1", target)).toEqual({
+      status: "completed", result: "succeeded", waitingOnApproval: false, finishTime: "2026-11-14T11:00:00.123Z",
+    });
   });
 });
 

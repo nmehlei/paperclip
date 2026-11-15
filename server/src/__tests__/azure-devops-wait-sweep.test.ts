@@ -47,7 +47,8 @@ function finalPr(overrides: Partial<AdoPrSnapshot> = {}): AdoPrSnapshot {
   };
 }
 
-const finishedBuild: AdoBuildSnapshot = { status: "completed", result: "succeeded", waitingOnApproval: false };
+const FINISHED_AT = "2026-11-14T11:00:00.000Z";
+const finishedBuild: AdoBuildSnapshot = { status: "completed", result: "succeeded", waitingOnApproval: false, finishTime: FINISHED_AT };
 
 function fakeClient(opts: { pr?: AdoPrSnapshot | null; build?: AdoBuildSnapshot | null } = {}) {
   return {
@@ -207,7 +208,7 @@ describeEmbeddedPostgres("azure devops wait sweep", () => {
 
     expect((await sweep.sweep()).woken).toBe(1);
     const [wake] = await activity(f.issueId, ADO_WAIT_ACTIVITY.wake);
-    expect(wake!.details).toEqual({ reason: "pipeline_finished", link: BUILD_URL(4700), identity: "4700" });
+    expect(wake!.details).toEqual({ reason: "pipeline_finished", link: BUILD_URL(4700), identity: `4700@${FINISHED_AT}` });
     await setMonitor(f.issueId, { link: BUILD_URL(4700) });
     expect(await sweep.sweep()).toEqual({ checked: 1, woken: 0, paused: 0, extended: 0 });
     expect(deps.triggerIssueMonitor).toHaveBeenCalledTimes(1);
@@ -228,7 +229,7 @@ describeEmbeddedPostgres("azure devops wait sweep", () => {
     pr = finalPr({ lastMergeSourceCommit: "c2" });
     expect((await sweep.sweep()).woken).toBe(1);
     const wakes = await activity(f.issueId, ADO_WAIT_ACTIVITY.wake);
-    expect(wakes.map((w) => (w.details as { identity: string }).identity).sort()).toEqual(["c1", "c2"]);
+    expect(wakes.map((w) => (w.details as { identity: string }).identity).sort()).toEqual(["c1|", "c2|"]);
   });
 
   it("holds a final PR wait while a merge card on the same PR is pending", async () => {
@@ -299,7 +300,7 @@ describeEmbeddedPostgres("azure devops wait sweep", () => {
     expect((await sweep.sweep()).woken).toBe(1);
     expect(enqueueWakeup).toHaveBeenCalledTimes(2);
 
-    build = { status: "inProgress", result: null, waitingOnApproval: true };
+    build = { status: "inProgress", result: null, waitingOnApproval: true, finishTime: null };
     await setMonitor(f.issueId, { link: BUILD_URL(3), nextCheckAt: new Date(Date.now() + HOUR) });
     expect((await sweep.sweep()).extended).toBe(1);
     [row] = await db.select().from(issues).where(eq(issues.id, f.issueId));
@@ -436,7 +437,7 @@ describeEmbeddedPostgres("azure devops wait sweep", () => {
     await setMonitor(f.issueId, { link: BUILD_URL(11), nextCheckAt: new Date(Date.now() + HOUR) });
     const deps = spies();
     const before = Date.now();
-    const result = await service(deps, fakeClient({ build: { status: "inProgress", result: null, waitingOnApproval: true } })).sweep();
+    const result = await service(deps, fakeClient({ build: { status: "inProgress", result: null, waitingOnApproval: true, finishTime: null } })).sweep();
 
     expect(result).toEqual({ checked: 1, woken: 0, paused: 0, extended: 1 });
     const [row] = await db.select().from(issues).where(eq(issues.id, f.issueId));
