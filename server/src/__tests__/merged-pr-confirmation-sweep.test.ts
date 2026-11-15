@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
-import { inArray } from "drizzle-orm";
+import { eq, inArray } from "drizzle-orm";
 import {
   activityLog,
   agents,
@@ -12,6 +12,8 @@ import {
   issues,
 } from "@paperclipai/db";
 import { ADO_WAIT_ACTIVITY } from "../services/azure-devops-wait-history.js";
+import { adoWaitMonitorUpdater, azureDevOpsWaitSweepService } from "../services/azure-devops-wait-sweep.js";
+import { prepareIssueMonitorUpdate } from "../services/issue-monitors.js";
 import {
   extractGitHubPullRequestReferences,
   getMergeConfirmationPullRequestReferences,
@@ -678,13 +680,64 @@ describeEmbeddedPostgres("merged pull-request confirmation sweep", () => {
   it("the merge sweep and the wait sweep racing on one issue at 5 wakes wake once", async () => {
     const f = await seedCard("RAC", 1505);
     await addWakes(f.companyId, f.issueId, 5);
+    const link = "https://dev.azure.com/pharao2k/NME-IaC/_build/results?buildId=77";
+    const [issue] = await db.select().from(issues).where(eq(issues.id, f.issueId));
+    const patch = prepareIssueMonitorUpdate(issue!, {
+      nextCheckAt: new Date(Date.now() + 72 * 3600_000).toISOString(),
+      notes: `Waiting on CI ${link}`,
+      kind: "external_service",
+      serviceName: "nme_ado_wait",
+      externalRef: link,
+      timeoutAt: new Date(Date.now() + 168 * 3600_000).toISOString(),
+      maxAttempts: null,
+      recoveryPolicy: "wake_owner",
+    } as never, { type: "agent", agentId: issue!.assigneeAgentId });
+    await db.update(issues).set(patch).where(eq(issues.id, f.issueId));
+
+    const waitDispatch = vi.fn(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      return { outcome: "triggered" as const };
+    });
+    const mergeWakeup = vi.fn(async () => ({ id: "w" }));
+    const waitSweep = azureDevOpsWaitSweepService(db, {
+      triggerIssueMonitor: waitDispatch as never,
+      updateIssueMonitor: adoWaitMonitorUpdater(db),
+      wakeup: vi.fn(async () => ({ id: "x" })) as never,
+      client: {
+        pr: vi.fn(async () => null),
+        build: vi.fn(async () => ({ status: "completed", result: "succeeded", waitingOnApproval: false })),
+        probe: vi.fn(async () => ({ builds: 200, policies: 200 })),
+      } as never,
+      config: { reviewerOrgs: [], agentIdentities: {} },
+    });
+    await Promise.all([waitSweep.sweep(), mergedService(mergeWakeup).sweepMergedPullRequestConfirmations()]);
+
+    expect(waitDispatch.mock.calls.length + mergeWakeup.mock.calls.length).toBe(1);
+    expect(await entries(f.issueId, ADO_WAIT_ACTIVITY.wake)).toHaveLength(6);
+    if (mergeWakeup.mock.calls.length === 0) {
+      expect(await cardStatus(f.cardId)).toBe("pending");
+      const paused = await entries(f.issueId, ADO_WAIT_ACTIVITY.pause);
+      expect(paused).toHaveLength(1);
+      expect(paused[0]!.details).toMatchObject({ pendingEvent: "merge_accepted" });
+    } else {
+      expect(await cardStatus(f.cardId)).toBe("accepted");
+    }
+  });
+
+  it("does not log a paused entry for a card resolved after the candidate load", async () => {
+    const f = await seedCard("STL", 1507);
+    await addWakes(f.companyId, f.issueId, 6);
     const wakeup = vi.fn(async () => ({ id: "w" }));
-    const service = mergedService(wakeup);
-    await Promise.all([
-      service.sweepMergedPullRequestConfirmations(),
-      service.sweepMergedPullRequestConfirmations(),
-    ]);
-    expect(wakeup).toHaveBeenCalledTimes(1);
+    const service = issueThreadInteractionService(db, {
+      wakeup: wakeup as never,
+      resolvePullRequestState: vi.fn(async () => {
+        await db.update(issueThreadInteractions).set({ status: "accepted" }).where(eq(issueThreadInteractions.id, f.cardId));
+        return "merged" as const;
+      }),
+    });
+    await service.sweepMergedPullRequestConfirmations();
+    expect(wakeup).not.toHaveBeenCalled();
+    expect(await entries(f.issueId, ADO_WAIT_ACTIVITY.pause)).toHaveLength(0);
     expect(await entries(f.issueId, ADO_WAIT_ACTIVITY.wake)).toHaveLength(6);
   });
 

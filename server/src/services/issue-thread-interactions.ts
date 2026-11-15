@@ -3065,6 +3065,13 @@ export function issueThreadInteractionService(
         // together they cannot exceed the wake bounds. A held card stays pending for a later tick.
         try {
           await withIssueWakeReservation<null>(db, candidate.issue.id, async (ctx) => {
+            // The candidate was loaded earlier; another sweep or a person may have resolved it since.
+            const [current] = await ctx.tx
+              .select({ status: issueThreadInteractions.status })
+              .from(issueThreadInteractions)
+              .where(eq(issueThreadInteractions.id, candidate.interaction.id))
+              .limit(1);
+            if (current?.status !== "pending") return { keep: false, value: null };
             const gate = gateWake(ctx.history, ctx.now);
             if (gate === "quota") return { keep: false, value: null };
             if (gate === "cap") {
