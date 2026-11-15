@@ -82,6 +82,32 @@ export function parseAdoWaitTarget(url: string): AdoWaitTarget | null {
   return { kind: "build", organization: segments[0]!, project: segments[1]!, buildId };
 }
 
+/**
+ * Stored monitor externalRefs are redacted by the write path, so the link normally comes
+ * from the notes: the last Azure DevOps PR or build URL outside any `Event:` line.
+ */
+export function resolveAdoWaitTarget(externalRef: unknown, notes: unknown): AdoWaitTarget | null {
+  if (typeof externalRef === "string") {
+    const direct = parseAdoWaitTarget(externalRef);
+    if (direct) return direct;
+  }
+  if (typeof notes !== "string") return null;
+  let found: AdoWaitTarget | null = null;
+  for (const line of notes.split("\n")) {
+    if (line.trimStart().startsWith("Event:")) continue;
+    for (const match of line.matchAll(/https:\/\/\S+/g)) {
+      const url = match[0].replace(/[.,;:!?)\]}>'"]+$/, "");
+      const target = parseAdoWaitTarget(url);
+      if (target) found = target;
+    }
+  }
+  return found;
+}
+
+export function adoPullRequestKey(ref: AzureDevOpsPullRequestReference) {
+  return `${ref.organization}/${ref.project}/${ref.repository}#${ref.number}`.toLowerCase();
+}
+
 function apiBase(organization: string, project: string) {
   return `https://dev.azure.com/${encodeURIComponent(organization)}/${encodeURIComponent(project)}/_apis`;
 }

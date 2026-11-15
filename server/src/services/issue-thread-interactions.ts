@@ -140,6 +140,7 @@ import {
 import { gateWake } from "./azure-devops-wait-decision.js";
 import {
   adoWaitSweepDisabled,
+  clearAdoWaitMonitorForPullRequests,
   logPausedOnce,
   withIssueWakeReservation,
 } from "./azure-devops-wait-history.js";
@@ -3080,6 +3081,8 @@ export function issueThreadInteractionService(
             }
             await ctx.reserve({ reason: "merge_accepted" });
             const outcome = await acceptAndWake();
+            // The agent learns about the merge from this wake; a wait on the same PR must not wake it again.
+            if (outcome.woke) await clearAdoWaitMonitorForPullRequests(ctx, candidate.issue.id, candidate.references);
             return { keep: outcome.woke, value: null };
           }, { now: now() });
         } catch (error) {

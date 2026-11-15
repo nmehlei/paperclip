@@ -677,11 +677,8 @@ describeEmbeddedPostgres("merged pull-request confirmation sweep", () => {
     expect(await entries(f.issueId, ADO_WAIT_ACTIVITY.wake)).toHaveLength(0);
   });
 
-  it("the merge sweep and the wait sweep racing on one issue at 5 wakes wake once", async () => {
-    const f = await seedCard("RAC", 1505);
-    await addWakes(f.companyId, f.issueId, 5);
-    const link = "https://dev.azure.com/pharao2k/NME-IaC/_build/results?buildId=77";
-    const [issue] = await db.select().from(issues).where(eq(issues.id, f.issueId));
+  async function parkWait(issueId: string, link: string) {
+    const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
     const patch = prepareIssueMonitorUpdate(issue!, {
       nextCheckAt: new Date(Date.now() + 72 * 3600_000).toISOString(),
       notes: `Waiting on CI ${link}`,
@@ -692,7 +689,76 @@ describeEmbeddedPostgres("merged pull-request confirmation sweep", () => {
       maxAttempts: null,
       recoveryPolicy: "wake_owner",
     } as never, { type: "agent", agentId: issue!.assigneeAgentId });
-    await db.update(issues).set(patch).where(eq(issues.id, f.issueId));
+    await db.update(issues).set(patch).where(eq(issues.id, issueId));
+  }
+
+  function completedPrWaitSweep(triggerIssueMonitor: ReturnType<typeof vi.fn>) {
+    return azureDevOpsWaitSweepService(db, {
+      triggerIssueMonitor: triggerIssueMonitor as never,
+      updateIssueMonitor: adoWaitMonitorUpdater(db),
+      wakeup: vi.fn(async () => ({ id: "x" })) as never,
+      client: {
+        pr: vi.fn(async () => ({
+          status: "completed", lastMergeSourceCommit: "s", lastMergeCommit: "m", lastPushAt: null,
+          evaluations: [], hasBuildPolicy: null, threads: [],
+        })),
+        build: vi.fn(async () => null),
+        probe: vi.fn(async () => ({ builds: 200, policies: 200 })),
+      } as never,
+      config: { reviewerOrgs: [], agentIdentities: {} },
+    });
+  }
+
+  const adoPr = (number: number) => `https://dev.azure.com/contoso/Web/_git/web-app/pullrequest/${number}`;
+
+  async function monitorNextCheckAt(issueId: string) {
+    const [row] = await db.select({ next: issues.monitorNextCheckAt }).from(issues).where(eq(issues.id, issueId));
+    return row?.next ?? null;
+  }
+
+  it("a merge with a wait monitor on the same PR wakes once", async () => {
+    const f = await seedCard("MWO", 1601);
+    await parkWait(f.issueId, adoPr(1601));
+    const mergeWakeup = vi.fn(async () => ({ id: "w" }));
+    const waitTrigger = vi.fn(async () => ({ outcome: "triggered" as const }));
+
+    await expect(mergedService(mergeWakeup).sweepMergedPullRequestConfirmations()).resolves.toMatchObject({ woken: 1 });
+    expect(await monitorNextCheckAt(f.issueId)).toBeNull();
+    expect(await completedPrWaitSweep(waitTrigger).sweep()).toMatchObject({ woken: 0 });
+
+    expect(mergeWakeup).toHaveBeenCalledTimes(1);
+    expect(waitTrigger).not.toHaveBeenCalled();
+    expect(await entries(f.issueId, ADO_WAIT_ACTIVITY.wake)).toHaveLength(1);
+    expect(await entries(f.issueId, "issue.monitor_cleared")).toHaveLength(1);
+  });
+
+  it("a merge with a wait monitor on the same PR wakes once when the wait sweep ticks first", async () => {
+    const f = await seedCard("MWT", 1602);
+    await parkWait(f.issueId, adoPr(1602));
+    const mergeWakeup = vi.fn(async () => ({ id: "w" }));
+    const waitTrigger = vi.fn(async () => ({ outcome: "triggered" as const }));
+
+    expect(await completedPrWaitSweep(waitTrigger).sweep()).toMatchObject({ woken: 0 });
+    await expect(mergedService(mergeWakeup).sweepMergedPullRequestConfirmations()).resolves.toMatchObject({ woken: 1 });
+
+    expect(waitTrigger).not.toHaveBeenCalled();
+    expect(mergeWakeup).toHaveBeenCalledTimes(1);
+    expect(await monitorNextCheckAt(f.issueId)).toBeNull();
+  });
+
+  it("keeps a wait monitor on another target when a card is accepted", async () => {
+    const f = await seedCard("MOT", 1603);
+    await parkWait(f.issueId, adoPr(1699));
+    await mergedService(vi.fn(async () => ({ id: "w" }))).sweepMergedPullRequestConfirmations();
+    expect(await cardStatus(f.cardId)).toBe("accepted");
+    expect(await monitorNextCheckAt(f.issueId)).not.toBeNull();
+    expect(await entries(f.issueId, "issue.monitor_cleared")).toHaveLength(0);
+  });
+
+  it("the merge sweep and the wait sweep racing on one issue at 5 wakes wake once", async () => {
+    const f = await seedCard("RAC", 1505);
+    await addWakes(f.companyId, f.issueId, 5);
+    await parkWait(f.issueId, "https://dev.azure.com/pharao2k/NME-IaC/_build/results?buildId=77");
 
     const waitDispatch = vi.fn(async () => {
       await new Promise((resolve) => setTimeout(resolve, 100));
@@ -710,18 +776,19 @@ describeEmbeddedPostgres("merged pull-request confirmation sweep", () => {
       } as never,
       config: { reviewerOrgs: [], agentIdentities: {} },
     });
-    await Promise.all([waitSweep.sweep(), mergedService(mergeWakeup).sweepMergedPullRequestConfirmations()]);
+    // Force the order: the merge sweep starts while the wait sweep holds the reservation.
+    const waitRun = waitSweep.sweep();
+    await vi.waitFor(() => expect(waitDispatch).toHaveBeenCalled());
+    const mergeRun = mergedService(mergeWakeup).sweepMergedPullRequestConfirmations();
+    await Promise.all([waitRun, mergeRun]);
 
-    expect(waitDispatch.mock.calls.length + mergeWakeup.mock.calls.length).toBe(1);
+    expect(waitDispatch).toHaveBeenCalledTimes(1);
+    expect(mergeWakeup).not.toHaveBeenCalled();
     expect(await entries(f.issueId, ADO_WAIT_ACTIVITY.wake)).toHaveLength(6);
-    if (mergeWakeup.mock.calls.length === 0) {
-      expect(await cardStatus(f.cardId)).toBe("pending");
-      const paused = await entries(f.issueId, ADO_WAIT_ACTIVITY.pause);
-      expect(paused).toHaveLength(1);
-      expect(paused[0]!.details).toMatchObject({ pendingEvent: "merge_accepted" });
-    } else {
-      expect(await cardStatus(f.cardId)).toBe("accepted");
-    }
+    expect(await cardStatus(f.cardId)).toBe("pending");
+    const paused = await entries(f.issueId, ADO_WAIT_ACTIVITY.pause);
+    expect(paused).toHaveLength(1);
+    expect(paused[0]!.details).toMatchObject({ pendingEvent: "merge_accepted" });
   });
 
   it("does not log a paused entry for a card resolved after the candidate load", async () => {

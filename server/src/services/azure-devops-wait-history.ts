@@ -1,7 +1,13 @@
 import { and, desc, eq, gt, isNull, or, sql } from "drizzle-orm";
 import { activityLog, heartbeatRuns, issueComments, issues, type Db } from "@paperclipai/db";
+import { logger } from "../middleware/logger.js";
 import { logActivity, publishActivity, type ActivityPublication } from "./activity-log.js";
+import type { AzureDevOpsPullRequestReference } from "./azure-devops-pull-request-merge.js";
+import { adoPullRequestKey, resolveAdoWaitTarget } from "./azure-devops-wait-client.js";
 import type { DeliveredWakes, WaitWakeReason, WakeHistory } from "./azure-devops-wait-decision.js";
+import { buildIssueMonitorClearedPatch, normalizeIssueExecutionPolicy } from "./issue-execution-policy.js";
+
+export const ADO_WAIT_SERVICE_NAME = "nme_ado_wait";
 
 export const ADO_WAIT_ACTIVITY = {
   wake: "nme_ado_wait.wake",
@@ -281,6 +287,63 @@ export async function withIssueWakeReservation<T>(
   });
   for (const publication of publications) publishActivity(publication);
   return outcome;
+}
+
+/**
+ * After a merge-card acceptance wake: clears the issue's pending wait monitor when it waits on
+ * one of the accepted PRs, so the wait sweep does not wake again with pr_closed. Same lock and
+ * write shape as the monitor updater; runs in a savepoint so a failure never undoes the wake.
+ * Call inside a reservation.
+ */
+export async function clearAdoWaitMonitorForPullRequests(
+  ctx: WakeReservationContext,
+  issueId: string,
+  references: ReadonlyArray<{ host: string }>,
+): Promise<boolean> {
+  const keys = new Set(
+    references
+      .filter((ref): ref is AzureDevOpsPullRequestReference => ref.host === "dev.azure.com")
+      .map(adoPullRequestKey),
+  );
+  if (keys.size === 0) return false;
+  try {
+    return await ctx.tx.transaction(async (rawSp) => {
+      const sp = rawSp as unknown as Db;
+      const [issue] = await sp.select().from(issues).where(eq(issues.id, issueId)).for("update");
+      if (!issue?.monitorNextCheckAt) return false;
+      const raw = (issue.executionPolicy as { monitor?: { serviceName?: unknown; externalRef?: unknown; notes?: unknown } } | null)
+        ?.monitor;
+      if (!raw || raw.serviceName !== ADO_WAIT_SERVICE_NAME) return false;
+      const target = resolveAdoWaitTarget(raw.externalRef, raw.notes ?? issue.monitorNotes);
+      if (target?.kind !== "pr" || !keys.has(adoPullRequestKey(target.ref))) return false;
+      const patch = buildIssueMonitorClearedPatch({
+        issue,
+        policy: normalizeIssueExecutionPolicy(issue.executionPolicy),
+        clearReason: "manual",
+        clearedAt: ctx.now,
+      });
+      await sp
+        .update(issues)
+        .set({
+          ...patch,
+          // Only the monitor belongs to us; keep the rest of the stored policy as it is.
+          executionPolicy: sql`nullif(${issues.executionPolicy} - 'monitor', '{}'::jsonb)`,
+          updatedAt: ctx.now,
+        })
+        .where(eq(issues.id, issueId));
+      await ctx.log("issue.monitor_cleared", {
+        identifier: issue.identifier,
+        previousNextCheckAt: issue.monitorNextCheckAt.toISOString(),
+        reason: "manual",
+        source: "merge_accepted",
+        notes: typeof raw.notes === "string" ? raw.notes : null,
+      });
+      return true;
+    });
+  } catch (err) {
+    logger.warn({ err, issueId }, "azure devops wait monitor clear after merge failed");
+    return false;
+  }
 }
 
 export const PAUSED_MESSAGE = "Automatic wakes paused: limit reached. Reply on the issue to resume.";

@@ -16,8 +16,9 @@ import {
   type AzureDevOpsPullRequestReference,
 } from "./azure-devops-pull-request-merge.js";
 import {
+  adoPullRequestKey,
   createAdoWaitClient,
-  parseAdoWaitTarget,
+  resolveAdoWaitTarget,
   type AdoBuildSnapshot,
   type AdoPrSnapshot,
   type AdoWaitTarget,
@@ -31,6 +32,7 @@ import {
 import {
   ADO_WAIT_ACTIVITY,
   ADO_WAIT_ACTOR_ID,
+  ADO_WAIT_SERVICE_NAME,
   adoWaitSweepDisabled,
   loadDeliveredWakes,
   logPausedOnce,
@@ -42,7 +44,7 @@ import { getMergeConfirmationPullRequestReferences } from "./issue-thread-intera
 import { issueService } from "./issues.js";
 import { secretService } from "./secrets.js";
 
-export const ADO_WAIT_SERVICE_NAME = "nme_ado_wait";
+export { ADO_WAIT_SERVICE_NAME, resolveAdoWaitTarget };
 
 const BACKSTOP_TIMEOUT_MS = 7 * 24 * 3600_000;
 const CLOSED_STATUSES = ["done", "cancelled"];
@@ -97,28 +99,6 @@ export function loadAdoWaitConfig(env: NodeJS.ProcessEnv = process.env): AdoWait
   return { reviewerOrgs, agentIdentities };
 }
 
-/**
- * Stored monitor externalRefs are redacted by the write path, so the link normally comes
- * from the notes: the last Azure DevOps PR or build URL outside any `Event:` line.
- */
-export function resolveAdoWaitTarget(externalRef: unknown, notes: unknown): AdoWaitTarget | null {
-  if (typeof externalRef === "string") {
-    const direct = parseAdoWaitTarget(externalRef);
-    if (direct) return direct;
-  }
-  if (typeof notes !== "string") return null;
-  let found: AdoWaitTarget | null = null;
-  for (const line of notes.split("\n")) {
-    if (line.trimStart().startsWith("Event:")) continue;
-    for (const match of line.matchAll(/https:\/\/\S+/g)) {
-      const url = match[0].replace(/[.,;:!?)\]}>'"]+$/, "");
-      const target = parseAdoWaitTarget(url);
-      if (target) found = target;
-    }
-  }
-  return found;
-}
-
 function targetLink(target: AdoWaitTarget) {
   const e = encodeURIComponent;
   if (target.kind === "build") {
@@ -126,10 +106,6 @@ function targetLink(target: AdoWaitTarget) {
   }
   const r = target.ref;
   return `https://dev.azure.com/${e(r.organization)}/${e(r.project)}/_git/${e(r.repository)}/pullrequest/${r.number}`;
-}
-
-function prKey(ref: AzureDevOpsPullRequestReference) {
-  return `${ref.organization}/${ref.project}/${ref.repository}#${ref.number}`.toLowerCase();
 }
 
 type CandidateOutcome =
@@ -180,7 +156,7 @@ async function loadCandidates(db: Db): Promise<Candidate[]> {
     if (!target || !row.agentId) continue;
     if (target.kind === "pr") {
       const set = monitorPrs.get(row.id) ?? new Set<string>();
-      set.add(prKey(target.ref));
+      set.add(adoPullRequestKey(target.ref));
       monitorPrs.set(row.id, set);
     }
     candidates.push({
@@ -238,7 +214,7 @@ async function loadCandidates(db: Db): Promise<Candidate[]> {
           organization: ref.organization,
           link: targetLink({ kind: "pr", ref }),
           monitorNextCheckAt: null,
-          monitorPendingForSamePr: monitorPrs.get(card.issue.id)?.has(prKey(ref)) ?? false,
+          monitorPendingForSamePr: monitorPrs.get(card.issue.id)?.has(adoPullRequestKey(ref)) ?? false,
         });
       }
     }
@@ -248,7 +224,7 @@ async function loadCandidates(db: Db): Promise<Candidate[]> {
 
 /** Whether a pending, ungoverned merge card on the issue names this PR (the merge sweep's selection). */
 async function mergeCardPendingForPr(tx: Db, issueId: string, ref: AzureDevOpsPullRequestReference): Promise<boolean> {
-  const wanted = prKey(ref);
+  const wanted = adoPullRequestKey(ref);
   const rows = await tx
     .select()
     .from(issueThreadInteractions)
@@ -259,7 +235,7 @@ async function mergeCardPendingForPr(tx: Db, issueId: string, ref: AzureDevOpsPu
     ));
   const matching = rows.filter((row) =>
     getMergeConfirmationPullRequestReferences(row).some(
-      (r) => r.host === "dev.azure.com" && prKey(r as AzureDevOpsPullRequestReference) === wanted,
+      (r) => r.host === "dev.azure.com" && adoPullRequestKey(r as AzureDevOpsPullRequestReference) === wanted,
     ),
   );
   if (matching.length === 0) return false;
