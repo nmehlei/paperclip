@@ -18,6 +18,25 @@ export function isQuotaFailure(run: { status: string; errorCode?: string | null;
   return run.status === "failed" && !!run.error && QUOTA_TEXT.test(run.error);
 }
 
+const MONTHS = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"];
+const WEEKDAYS = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"];
+
+/** A missing hour means midnight. */
+function clockTime(rawHour: string | undefined, rawMinute: string | undefined, rawMeridiem: string | undefined) {
+  if (rawHour === undefined) return { hour: 0, minute: 0 };
+  let hour = Number(rawHour);
+  const minute = rawMinute ? Number(rawMinute) : 0;
+  const meridiem = rawMeridiem?.toLowerCase();
+  if (meridiem) {
+    if (hour < 1 || hour > 12) return null;
+    hour = (hour % 12) + (meridiem === "pm" ? 12 : 0);
+  } else if (hour > 23) {
+    return null;
+  }
+  if (minute > 59) return null;
+  return { hour, minute };
+}
+
 /** Zone-less times are interpreted in the server's local zone. */
 export function parseQuotaReset(error: string | null, now: Date): Date | null {
   if (!error) return null;
@@ -34,19 +53,44 @@ export function parseQuotaReset(error: string | null, now: Date): Date | null {
     return new Date(now.getTime() + Number(relative[1]) * unit);
   }
 
+  const dayTime = String.raw`(?:,?\s*(?:at\s+)?(\d{1,2})(?!\d)(?::(\d{2}))?\s*(am|pm)?)?`;
+
+  const monthDay = new RegExp(
+    String.raw`resets(?:\s+on)?\s+(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|june?|july?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\.?\s+(\d{1,2})(?:st|nd|rd|th)?\b${dayTime}`,
+    "i",
+  ).exec(error);
+  if (monthDay) {
+    const month = MONTHS.indexOf(monthDay[1]!.slice(0, 3).toLowerCase());
+    const day = Number(monthDay[2]);
+    const time = clockTime(monthDay[3], monthDay[4], monthDay[5]);
+    if (!time) return null;
+    for (const year of [now.getFullYear(), now.getFullYear() + 1]) {
+      const candidate = new Date(year, month, day, time.hour, time.minute, 0, 0);
+      if (candidate.getMonth() !== month || candidate.getDate() !== day) return null;
+      if (candidate.getTime() > now.getTime()) return candidate;
+    }
+    return null;
+  }
+
+  const weekday = new RegExp(
+    String.raw`resets(?:\s+on)?\s+(mon(?:day)?|tue(?:s(?:day)?)?|wed(?:nesday)?|thu(?:r(?:s(?:day)?)?)?|fri(?:day)?|sat(?:urday)?|sun(?:day)?)\b\.?${dayTime}`,
+    "i",
+  ).exec(error);
+  if (weekday) {
+    const target = WEEKDAYS.indexOf(weekday[1]!.slice(0, 3).toLowerCase());
+    const time = clockTime(weekday[2], weekday[3], weekday[4]);
+    if (!time) return null;
+    const candidate = new Date(now.getFullYear(), now.getMonth(), now.getDate(), time.hour, time.minute, 0, 0);
+    candidate.setDate(candidate.getDate() + ((target - now.getDay() + 7) % 7));
+    if (candidate.getTime() <= now.getTime()) candidate.setDate(candidate.getDate() + 7);
+    return candidate;
+  }
+
   const clock = /resets(?:\s+at)?\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?/i.exec(error);
   if (clock) {
-    let hour = Number(clock[1]);
-    const minute = clock[2] ? Number(clock[2]) : 0;
-    const meridiem = clock[3]?.toLowerCase();
-    if (meridiem) {
-      if (hour < 1 || hour > 12) return null;
-      hour = (hour % 12) + (meridiem === "pm" ? 12 : 0);
-    } else if (hour > 23) {
-      return null;
-    }
-    if (minute > 59) return null;
-    const candidate = new Date(now.getFullYear(), now.getMonth(), now.getDate(), hour, minute, 0, 0);
+    const time = clockTime(clock[1], clock[2], clock[3]);
+    if (!time) return null;
+    const candidate = new Date(now.getFullYear(), now.getMonth(), now.getDate(), time.hour, time.minute, 0, 0);
     if (candidate.getTime() <= now.getTime()) candidate.setDate(candidate.getDate() + 1);
     return candidate;
   }

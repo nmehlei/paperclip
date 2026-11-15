@@ -55,6 +55,21 @@ describe("parseQuotaReset", () => {
     expect(parseQuotaReset("try again in 45 minutes", now)).toEqual(new Date(now.getTime() + 45 * 60_000));
   });
 
+  it("parses a month-day reset as its next future occurrence", () => {
+    // now is Sat 2026-11-14 12:00 local
+    expect(parseQuotaReset("weekly limit reached ∙ resets Nov 17, 9am", now)).toEqual(new Date(2026, 10, 17, 9, 0, 0));
+    expect(parseQuotaReset("weekly limit reached ∙ resets Nov 17 at 9:30 pm", now)).toEqual(new Date(2026, 10, 17, 21, 30, 0));
+    expect(parseQuotaReset("weekly limit reached ∙ resets Jan 3, 9am", now)).toEqual(new Date(2027, 0, 3, 9, 0, 0));
+    expect(parseQuotaReset("weekly limit reached ∙ resets Nov 14, 10am", now)).toEqual(new Date(2027, 10, 14, 10, 0, 0));
+  });
+
+  it("parses a weekday reset as its next future occurrence", () => {
+    expect(parseQuotaReset("weekly limit reached ∙ resets Mon 9am", now)).toEqual(new Date(2026, 10, 16, 9, 0, 0));
+    expect(parseQuotaReset("weekly limit reached ∙ resets Monday at 9am", now)).toEqual(new Date(2026, 10, 16, 9, 0, 0));
+    expect(parseQuotaReset("weekly limit reached ∙ resets Sat 3pm", now)).toEqual(new Date(2026, 10, 14, 15, 0, 0));
+    expect(parseQuotaReset("weekly limit reached ∙ resets Sat 9am", now)).toEqual(new Date(2026, 10, 21, 9, 0, 0));
+  });
+
   it("returns null when nothing parses", () => {
     expect(parseQuotaReset(null, now)).toBeNull();
     expect(parseQuotaReset("something broke", now)).toBeNull();
