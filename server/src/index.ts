@@ -96,6 +96,7 @@ import {
 import { questionResponseDeliveryService } from "./services/question-response-delivery.js";
 import { deliverNativeQuestionResponse } from "./services/native-runtime/native-question-bridge.js";
 import { queueIssueAssignmentWakeup } from "./services/issue-assignment-wakeup.js";
+import { adoWaitMonitorUpdater, azureDevOpsWaitSweepService, probeAzureDevOpsWaitOrganizations } from "./services/azure-devops-wait-sweep.js";
 import { createSecretProposalsService } from "./services/secret-proposals.js";
 import { environmentRuntimeService } from "./services/environment-runtime.js";
 import { createDbAdapterAuthSessionStore } from "./services/device-login-service.js";
@@ -1374,6 +1375,30 @@ async function startServerWithDatabaseTeardown(
           logger.error({ err }, "merged pull-request confirmation sweep failed");
         }));
     };
+    const azureDevOpsWaitSweep = azureDevOpsWaitSweepService(db as any, {
+      triggerIssueMonitor: (issueId, input) => heartbeat.triggerIssueMonitor(issueId, input),
+      updateIssueMonitor: adoWaitMonitorUpdater(db as any),
+      wakeup: heartbeat.wakeup,
+      addComment: (issueId, body) => issues.addComment(issueId, body, {}, { authorType: "system" }),
+    });
+    let azureDevOpsWaitSweepInFlight = false;
+    const scheduleAzureDevOpsWaitSweep = () => {
+      if (isIdleTaskDrainActive() || heartbeatSchedulerStopped || azureDevOpsWaitSweepInFlight) return;
+      azureDevOpsWaitSweepInFlight = true;
+      trackHeartbeatSchedulerWork(azureDevOpsWaitSweep
+        .sweep()
+        .then((result) => {
+          if (result.woken > 0 || result.paused > 0 || result.extended > 0) {
+            logger.info(result, "azure devops wait sweep acted");
+          }
+        })
+        .catch((err) => {
+          logger.error({ err }, "azure devops wait sweep failed");
+        })
+        .finally(() => {
+          azureDevOpsWaitSweepInFlight = false;
+        }));
+    };
     // Emit a periodic signal when the reaper inspects candidates but archives
     // none, so an inert reaper that skips every candidate is never fully silent.
     // The throttle keeps the 30s cadence from flooding the log.
@@ -1671,6 +1696,11 @@ async function startServerWithDatabaseTeardown(
     };
     await runRetentionSweep();
 
+    // One-shot: confirm each organization's stored PAT can read builds and policies (statuses only).
+    trackHeartbeatSchedulerWork(probeAzureDevOpsWaitOrganizations(db as any).catch((err: unknown) => {
+      logger.warn({ err }, "azure devops wait probe failed");
+    }));
+
     startHeartbeatSchedulerInterval(() => {
       // Track the outer async callback as well as the work it starts. Shutdown
       // can then wait through an already-running suppression check before it
@@ -1709,6 +1739,7 @@ async function startServerWithDatabaseTeardown(
 
         if (isIdleTaskDrainActive() || heartbeatSchedulerStopped) return;
         scheduleMergedPullRequestConfirmationSweep();
+        scheduleAzureDevOpsWaitSweep();
         scheduleGitHubConnectionEventPoll();
         scheduleGitHubConnectionContinuitySweep();
         scheduleTerminalWorkspaceSweep();

@@ -14,6 +14,8 @@ permissions:
 
 jobs:
   review:
+    # NME fork: needs upstream's bot credentials and dependency graph.
+    if: github.repository == 'paperclipai/paperclip'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:

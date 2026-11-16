@@ -137,6 +137,13 @@ import {
   setBoundedPullRequestCacheEntry,
   type PullRequestMergeState,
 } from "./github-pull-request-merge.js";
+import { gateWake } from "./azure-devops-wait-decision.js";
+import {
+  adoWaitSweepDisabled,
+  clearAdoWaitMonitorForPullRequests,
+  logPausedOnce,
+  withIssueWakeReservation,
+} from "./azure-devops-wait-history.js";
 import { AZURE_DEVOPS_PULL_REQUEST_URL_PATTERN } from "./azure-devops-pull-request-merge.js";
 import {
   createMergeConfirmationPullRequestStateResolver,
@@ -2968,79 +2975,116 @@ export function issueThreadInteractionService(
         });
         if (!allMerged) continue;
 
-        let resolved: Awaited<ReturnType<typeof acceptRequestConfirmation>>;
-        try {
-          resolved = await acceptRequestConfirmation({
-            issue: candidate.issue,
-            current: candidate.interaction,
-            input: {},
-            actor: {
-              systemId: "system:pr-merged",
-              resolutionDetails: {
-                source: "merged_pull_request_sweep",
-                pullRequests: candidate.references.map(pullRequestReferenceLabel),
+        // Accepts the card and wakes the assignee. Returns whether a wake was dispatched.
+        const acceptAndWake = async (): Promise<{ accepted: boolean; woke: boolean }> => {
+          let resolved: Awaited<ReturnType<typeof acceptRequestConfirmation>>;
+          try {
+            resolved = await acceptRequestConfirmation({
+              issue: candidate.issue,
+              current: candidate.interaction,
+              input: {},
+              actor: {
+                systemId: "system:pr-merged",
+                resolutionDetails: {
+                  source: "merged_pull_request_sweep",
+                  pullRequests: candidate.references.map(pullRequestReferenceLabel),
+                },
               },
-            },
-          });
-        } catch (error) {
-          if (
-            error &&
-            typeof error === "object" &&
-            "status" in error &&
-            error.status === 409
-          )
-            continue;
-          firstError ??= error;
-          continue;
-        }
-        if (resolved.interaction.status !== "accepted") continue;
-        accepted += 1;
+            });
+          } catch (error) {
+            if (
+              error &&
+              typeof error === "object" &&
+              "status" in error &&
+              error.status === 409
+            )
+              return { accepted: false, woke: false };
+            firstError ??= error;
+            return { accepted: false, woke: false };
+          }
+          if (resolved.interaction.status !== "accepted") return { accepted: false, woke: false };
+          accepted += 1;
 
-        const wakeIssue = resolved.continuationIssue ?? candidate.issue;
-        const shouldWake =
-          resolved.interaction.continuationPolicy === "wake_assignee" ||
-          resolved.interaction.continuationPolicy === "wake_assignee_on_accept";
-        if (
-          !opts.wakeup ||
-          !shouldWake ||
-          !wakeIssue.assigneeAgentId ||
-          isTerminalIssueStatus(wakeIssue.status)
-        ) {
+          const wakeIssue = resolved.continuationIssue ?? candidate.issue;
+          const shouldWake =
+            resolved.interaction.continuationPolicy === "wake_assignee" ||
+            resolved.interaction.continuationPolicy === "wake_assignee_on_accept";
+          if (
+            !opts.wakeup ||
+            !shouldWake ||
+            !wakeIssue.assigneeAgentId ||
+            isTerminalIssueStatus(wakeIssue.status)
+          ) {
+            return { accepted: true, woke: false };
+          }
+          try {
+            await opts.wakeup(wakeIssue.assigneeAgentId, {
+              source: "automation",
+              triggerDetail: "system",
+              reason: "issue_commented",
+              payload: {
+                issueId: wakeIssue.id,
+                interactionId: resolved.interaction.id,
+                interactionKind: resolved.interaction.kind,
+                interactionStatus: resolved.interaction.status,
+                sourceCommentId: resolved.interaction.sourceCommentId ?? null,
+                sourceRunId: resolved.interaction.sourceRunId ?? null,
+                mutation: "interaction",
+                resolutionSource: "merged_pull_request_sweep",
+              },
+              idempotencyKey: `interaction:${resolved.interaction.id}:accepted`,
+              // A merged-PR confirmation may already be visible in an external
+              // provider conversation. Keep its continuation causally isolated
+              // from unrelated queued chat/internal work on the same task.
+              allowRunCoalescing: false,
+              requestedByActorType: "system",
+              requestedByActorId: "system:pr-merged",
+              contextSnapshot: {
+                issueId: wakeIssue.id,
+                taskId: wakeIssue.id,
+                interactionId: resolved.interaction.id,
+                interactionKind: resolved.interaction.kind,
+                interactionStatus: resolved.interaction.status,
+                wakeReason: "issue_commented",
+                source: "merged_pull_request_sweep",
+              },
+            });
+            woken += 1;
+            return { accepted: true, woke: true };
+          } catch (error) {
+            firstError ??= error;
+            return { accepted: true, woke: false };
+          }
+        };
+
+        if (adoWaitSweepDisabled()) {
+          await acceptAndWake();
           continue;
         }
+
+        // The merge sweep and the wait sweep share one per-issue lock and wake history, so
+        // together they cannot exceed the wake bounds. A held card stays pending for a later tick.
         try {
-          await opts.wakeup(wakeIssue.assigneeAgentId, {
-            source: "automation",
-            triggerDetail: "system",
-            reason: "issue_commented",
-            payload: {
-              issueId: wakeIssue.id,
-              interactionId: resolved.interaction.id,
-              interactionKind: resolved.interaction.kind,
-              interactionStatus: resolved.interaction.status,
-              sourceCommentId: resolved.interaction.sourceCommentId ?? null,
-              sourceRunId: resolved.interaction.sourceRunId ?? null,
-              mutation: "interaction",
-              resolutionSource: "merged_pull_request_sweep",
-            },
-            idempotencyKey: `interaction:${resolved.interaction.id}:accepted`,
-            // A merged-PR confirmation may already be visible in an external
-            // provider conversation. Keep its continuation causally isolated
-            // from unrelated queued chat/internal work on the same task.
-            allowRunCoalescing: false,
-            requestedByActorType: "system",
-            requestedByActorId: "system:pr-merged",
-            contextSnapshot: {
-              issueId: wakeIssue.id,
-              taskId: wakeIssue.id,
-              interactionId: resolved.interaction.id,
-              interactionKind: resolved.interaction.kind,
-              interactionStatus: resolved.interaction.status,
-              wakeReason: "issue_commented",
-              source: "merged_pull_request_sweep",
-            },
-          });
-          woken += 1;
+          await withIssueWakeReservation<null>(db, candidate.issue.id, async (ctx) => {
+            // The candidate was loaded earlier; another sweep or a person may have resolved it since.
+            const [current] = await ctx.tx
+              .select({ status: issueThreadInteractions.status })
+              .from(issueThreadInteractions)
+              .where(eq(issueThreadInteractions.id, candidate.interaction.id))
+              .limit(1);
+            if (current?.status !== "pending") return { keep: false, value: null };
+            const gate = gateWake(ctx.history, ctx.now);
+            if (gate === "quota") return { keep: false, value: null };
+            if (gate === "cap") {
+              await logPausedOnce(ctx, candidate.issue.id, "merge_accepted");
+              return { keep: false, value: null };
+            }
+            await ctx.reserve({ reason: "merge_accepted" });
+            const outcome = await acceptAndWake();
+            // The agent learns about the merge from this wake; a wait on the same PR must not wake it again.
+            if (outcome.woke) await clearAdoWaitMonitorForPullRequests(ctx, candidate.issue.id, candidate.references);
+            return { keep: outcome.woke, value: null };
+          }, { now: now() });
         } catch (error) {
           firstError ??= error;
         }
