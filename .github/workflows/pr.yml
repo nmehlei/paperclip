@@ -10,6 +10,8 @@ permissions:
 
 jobs:
   ci:
+    # NME fork: upstream's master CI does not match this tree; nme.yml gates fork PRs.
+    if: github.repository == 'paperclipai/paperclip'
     # Master requires CODEOWNERS review for .github/**, including this workflow.
     # The AWS runner group permits pr-trusted.yml@refs/heads/master.
     uses: paperclipai/paperclip/.github/workflows/pr-trusted.yml@master
