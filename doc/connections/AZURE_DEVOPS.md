@@ -48,8 +48,11 @@ Events that wake the assignee:
   comment by the configured identity after the last push, or 30 minutes after it);
 - a watched build has finished;
 - for a pending merge confirmation, new review comments or a rejecting vote on its
-  pull request, once they are 10 minutes old, unless a monitor already watches that
-  pull request;
+  pull request, once they are 10 minutes old. The pending card owns a handed-over pull
+  request: a wait monitor on a pull request that a pending card names exactly (that one
+  pull request only) is held while the card is pending, so it fires neither for
+  validation nor for the merge; an abandon still fires it. A CI failure without a new
+  push therefore wakes nobody while the card is pending;
 - a merge confirmation was accepted by the merge sweep (`merge_accepted`).
 
 A pipeline that waits on a manual approval extends the monitor to the 72 h backstop
