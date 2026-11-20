@@ -1,0 +1,96 @@
+name: NME image
+
+# Builds ghcr.io/nmehlei/paperclip:<upstream version>-nme.<n>: the stock upstream image plus
+# Chromium (see Dockerfile). A push to nme-image builds and tests only; a tag
+# nme/v<upstream version>-nme.<n> on this branch also pushes.
+on:
+  push:
+    branches: [nme-image]
+    tags: ["nme/v*"]
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: nme-image-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Version from the tag, checked against the Dockerfile's base
+        id: version
+        run: |
+          base="$(sed -nE 's/^ARG BASE=ghcr\.io\/paperclipai\/paperclip:([^@]+)@sha256:[0-9a-f]{64}$/\1/p' Dockerfile)"
+          [ -n "$base" ] || { echo "Dockerfile: BASE must be ghcr.io/paperclipai/paperclip:<version>@sha256:<digest>"; exit 1; }
+          if [[ "$GITHUB_REF" == refs/tags/nme/v* ]]; then
+            version="${GITHUB_REF#refs/tags/nme/v}"
+            n="${version#"$base"-nme.}"
+            [[ "$version" == "$base-nme.$n" && "$n" =~ ^(0|[1-9][0-9]*)$ ]] || { echo "Tag $version does not match base $base (expected $base-nme.<n>)"; exit 1; }
+            echo "push=true" >> "$GITHUB_OUTPUT"
+          else
+            version="$base-nme.test"
+            echo "push=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Build
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          tags: nme-paperclip:test
+          # Our own provenance instead of the labels inherited from the upstream image.
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ steps.version.outputs.version }}
+
+      # Chromium must start as the agents' user (node, no root) and render a page; the Hermes
+      # adapter file that NME-IaC's start-time patch edits must exist.
+      - name: Smoke test
+        run: |
+          docker run --rm --user node -e HOME=/tmp --entrypoint sh nme-paperclip:test -c '
+            set -e
+            "$CHROME_PATH" --version
+            cd /tmp
+            timeout 60 "$CHROME_PATH" --headless --no-sandbox --disable-gpu --screenshot=/tmp/shot.png "data:text/html,<h1>ok</h1>"
+            test -s /tmp/shot.png
+            test -f /app/packages/adapters/hermes/src/gateway/server/execute.ts
+            node --version'
+
+      - uses: docker/login-action@v4
+        if: steps.version.outputs.push == 'true'
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Push exactly the image that passed the smoke test (no second build).
+      - name: Push
+        if: steps.version.outputs.push == 'true'
+        env:
+          IMAGE: ghcr.io/${{ github.repository }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          # A published version is never replaced: its digest is what NME-IaC pins and documents.
+          if docker manifest inspect "$IMAGE:$VERSION" >/dev/null 2>&1; then
+            echo "$IMAGE:$VERSION already exists; tag a new nme.<n> instead"; exit 1
+          fi
+          for tag in "$VERSION" "sha-$GITHUB_SHA"; do
+            docker tag nme-paperclip:test "$IMAGE:$tag"
+            docker push "$IMAGE:$tag"
+          done
+          docker buildx imagetools inspect "$IMAGE:$VERSION"
