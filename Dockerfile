@@ -4,7 +4,7 @@
 #
 # Upgrade: bump BASE (tag and digest together), then push the tag nme/v<upstream version>-nme.<n>.
 # The workflow refuses a tag whose version does not match BASE.
-ARG BASE=ghcr.io/paperclipai/paperclip:2026.1023.0@sha256:40f46940c4612ead131aebe6079cd4651f8cd1434af49f7c621887f4a452a62e
+ARG BASE=ghcr.io/paperclipai/paperclip:2026.1117.0@sha256:bdf38d10544dc6c831e16dc027f23ad586353ef3be1a1b2c6979e63b956aceb1
 FROM ${BASE}
 # The base runs as root (its entrypoint drops to `node`), so apt works and USER stays unchanged.
 RUN apt-get update \
