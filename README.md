@@ -12,9 +12,11 @@ Our additions to Paperclip live in NME-IaC (`solutions/paperclip`): the Azure De
 
 1. Bump `BASE` in the `Dockerfile` (tag and digest together:
    `docker buildx imagetools inspect ghcr.io/paperclipai/paperclip:<version>`) and push to
-   `nme-image`. The workflow builds and smoke-tests: Chromium renders a page as `node`, and the
+   `nme-image`. The workflow builds and smoke-tests: Chromium renders a page as `node`, the
    Hermes adapter file that NME-IaC's start-time patch edits
-   (`packages/adapters/hermes/src/gateway/server/execute.ts`) must exist.
+   (`packages/adapters/hermes/src/gateway/server/execute.ts`) must exist, and so must NME-IaC's
+   start path (`server/dist/index.js` and the `tsx` loader; upstream itself starts
+   `server/dist-runtime/index.mjs`, a bundle the patch cannot reach).
 2. Tag the commit `nme/v<version>-nme.<n>` and push the tag; the workflow pushes the image. A tag
    whose version does not match `BASE` fails, and so does one that is already published (a
    re-run, also via "Run workflow" on the tag, never replaces an image). A new `<n>` on the same

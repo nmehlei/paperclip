@@ -69,6 +69,8 @@ jobs:
             timeout 60 "$CHROME_PATH" --headless --no-sandbox --disable-gpu --screenshot=/tmp/shot.png "data:text/html,<h1>ok</h1>"
             test -s /tmp/shot.png
             test -f /app/packages/adapters/hermes/src/gateway/server/execute.ts
+            test -f /app/server/dist/index.js
+            test -f /app/server/node_modules/tsx/dist/loader.mjs
             node --version'
 
       - uses: docker/login-action@v4
